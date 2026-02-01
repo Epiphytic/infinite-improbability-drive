@@ -2,6 +2,7 @@
 //!
 //! Three-phase workflow: Plan → Build → Validate
 
+pub mod approval;
 pub mod config;
 pub mod result;
 pub mod task;
@@ -15,3 +16,4 @@ pub use result::{
     FunctionalTestResult, PlanResult, TaskResult, ValidationResult,
 };
 pub use task::{CruisePlan, CruiseTask, TaskComplexity, TaskStatus};
+pub use approval::{ApprovalPoller, PrStatus};
