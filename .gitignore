@@ -1,0 +1,21 @@
+# Rust
+/core/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spawn logs (generated at runtime)
+.improbability-drive/
+
+# Temporary files
+*.tmp
+*.temp

@@ -1,0 +1,24 @@
+{
+  "name": "infinite-improbability-drive",
+  "version": "0.1.0",
+  "description": "Claude Code plugin for spawning sandboxed LLM instances with intelligent resource provisioning and lifecycle management",
+  "author": "Epiphytic",
+  "repository": "https://github.com/epiphytic/infinite-improbability-drive",
+  "license": "MIT",
+  "keywords": [
+    "spawn",
+    "sandbox",
+    "llm",
+    "worktree",
+    "isolation"
+  ],
+  "skills": [
+    "skills/spawn/SKILL.md"
+  ],
+  "commands": [
+    "commands/spawn.md"
+  ],
+  "agents": [
+    "agents/watcher.md"
+  ]
+}
