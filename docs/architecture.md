@@ -85,6 +85,12 @@ Injects secrets as environment variables and redacts them from all log output.
 
 **Location:** `core/src/secrets.rs`
 
+### ConfigValidator
+
+Validates configuration before spawning to catch errors early. Implements the `Validate` trait for all configuration types, distinguishing between fatal errors and warnings.
+
+**Location:** `core/src/config.rs`
+
 ## Data Flow
 
 ### Spawn Flow
