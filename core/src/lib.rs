@@ -35,6 +35,7 @@ pub use config::{
     KNOWN_LLMS, KNOWN_TOOLS,
 };
 pub use cruise::{
-    ApprovalConfig, BuildingConfig, CruiseConfig, PlanningConfig, PrStrategy, RepoLifecycle,
-    TestConfig, TestLevel, ValidationConfig as CruiseValidationConfig,
+    ApprovalConfig, BuildingConfig, CruiseConfig, CruisePlan, CruiseTask, PlanningConfig,
+    PrStrategy, RepoLifecycle, TaskComplexity, TaskStatus, TestConfig, TestLevel,
+    ValidationConfig as CruiseValidationConfig,
 };
