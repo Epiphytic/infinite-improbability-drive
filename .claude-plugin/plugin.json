@@ -13,10 +13,12 @@
     "isolation"
   ],
   "skills": [
-    "skills/spawn/SKILL.md"
+    "skills/spawn/SKILL.md",
+    "skills/spawn-team/SKILL.md"
   ],
   "commands": [
-    "commands/spawn.md"
+    "commands/spawn.md",
+    "commands/spawn-team.md"
   ],
   "agents": [
     "agents/watcher.md"
