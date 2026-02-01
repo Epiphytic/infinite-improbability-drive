@@ -3,8 +3,10 @@
 //! Supports Claude Code and Gemini CLI in headless streaming mode.
 
 mod claude;
+mod gemini;
 
 pub use claude::ClaudeRunner;
+pub use gemini::GeminiRunner;
 
 use std::path::PathBuf;
 use std::process::ExitStatus;

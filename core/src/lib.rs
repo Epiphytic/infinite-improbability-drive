@@ -11,14 +11,19 @@ pub mod runner;
 pub mod sandbox;
 pub mod secrets;
 pub mod spawn;
+pub mod team;
 pub mod watcher;
 
 pub use error::Error;
 pub use monitor::{ProgressMonitor, ProgressSummary, TimeoutConfig, TimeoutReason};
 pub use permissions::{PermissionDetector, PermissionError, PermissionErrorType, PermissionFix};
 pub use pr::{ConflictFile, ConflictStrategy, MergeStatus, PRManager, PullRequest};
-pub use runner::{ClaudeRunner, LLMOutput, LLMResult, LLMRunner, LLMSpawnConfig};
+pub use runner::{ClaudeRunner, GeminiRunner, LLMOutput, LLMResult, LLMRunner, LLMSpawnConfig};
 pub use sandbox::{Sandbox, SandboxManifest, SandboxProvider};
 pub use secrets::{SecretError, SecretRef, SecretSource, SecretsManager};
 pub use spawn::{SpawnConfig, SpawnResult, SpawnStatus};
+pub use team::{
+    CoordinationMode, FixPromptBuilder, ReviewPromptBuilder, ReviewResult, ReviewSuggestion,
+    ReviewVerdict, SpawnTeamConfig, SpawnTeamResult,
+};
 pub use watcher::{RecoveryStrategy, TerminationReason, WatcherAgent, WatcherConfig, WatcherResult};
