@@ -1,0 +1,28 @@
+[test]
+name = "cruise-control-e2e"
+prompt = """
+Build a sqlite gui interface in rust with jwt authentication
+using a locally generated ca and private key. Ensure that the
+plan shows dependencies between the pieces so that multiple
+teams can work on it in parallel.
+"""
+
+[repository]
+org = "epiphytic"
+name_prefix = "cruise-control-test"
+lifecycle = "ephemeral"
+cleanup_on_success = true
+cleanup_on_failure = false
+
+[execution]
+max_parallel = 3
+pr_strategy = "per-task"
+plan_approval = "auto"
+
+[timeouts]
+part1_max_secs = 1800
+part2_max_secs = 7200
+part3_max_secs = 1800
+
+[success_criteria]
+level = "functional"
