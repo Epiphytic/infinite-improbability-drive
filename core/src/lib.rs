@@ -4,6 +4,7 @@
 //! in git worktree sandboxes with intelligent resource provisioning and lifecycle management.
 
 pub mod config;
+pub mod cruise;
 pub mod error;
 pub mod monitor;
 pub mod permissions;
@@ -32,4 +33,8 @@ pub use watcher::{RecoveryStrategy, TerminationReason, WatcherAgent, WatcherConf
 pub use config::{
     validate_spawn_operation, validate_spawn_team_operation, Validate, ValidationResult,
     KNOWN_LLMS, KNOWN_TOOLS,
+};
+pub use cruise::{
+    ApprovalConfig, BuildingConfig, CruiseConfig, PlanningConfig, PrStrategy, RepoLifecycle,
+    TestConfig, TestLevel, ValidationConfig as CruiseValidationConfig,
 };
