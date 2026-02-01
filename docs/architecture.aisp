@@ -1,0 +1,214 @@
+𝔸5.1.infinite-improbability-drive.architecture@2026-02-01
+γ≔claude-code-plugin:spawn-sandboxed-llm
+
+⟦Ω:Foundation⟧{
+  Purpose≜"Spawn isolated LLM instances for delegated task execution";
+  Ambig(D)<0.02;
+  δ≥0.60;
+}
+
+⟦Σ:TypeUniverse⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Core Types⦘
+  ─────────────────────────────────────────────────────────────────
+
+  SpawnRequest≜{
+    prompt:String,
+    mode:Mode,
+    config:SpawnConfig
+  };
+
+  Mode≜AISP∨Passthrough;
+
+  SpawnConfig≜{
+    recovery_strategy:RecoveryStrategy,
+    idle_timeout:Duration,
+    total_timeout:Duration,
+    llm:LLMTarget
+  };
+
+  RecoveryStrategy≜Moderate∨Aggressive∨Interactive;
+
+  LLMTarget≜ClaudeCode∨GeminiCli;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Sandbox Types⦘
+  ─────────────────────────────────────────────────────────────────
+
+  SandboxManifest≜{
+    readable_paths:Set⟨PathPattern⟩,
+    writable_paths:Set⟨PathPattern⟩,
+    allowed_tools:Set⟨ToolName⟩,
+    allowed_commands:Set⟨CommandPattern⟩,
+    environment:Map⟨String,String⟩,
+    secrets:Set⟨SecretRef⟩,
+    complexity:TaskComplexity
+  };
+
+  TaskComplexity≜Low∨Medium∨High;
+
+  SandboxProvider≜trait{
+    create:(SandboxManifest)→Result⟨Sandbox,SandboxError⟩;
+    destroy:(Sandbox)→Result⟨(),SandboxError⟩;
+  };
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Result Types⦘
+  ─────────────────────────────────────────────────────────────────
+
+  SpawnResult≜{
+    status:SpawnStatus,
+    spawn_id:UUID,
+    duration:Duration,
+    files_changed:Vec⟨FileChange⟩,
+    commits:Vec⟨CommitInfo⟩,
+    summary:String,
+    pr_url:Option⟨URL⟩,
+    logs:SpawnLogs
+  };
+
+  SpawnStatus≜Success∨Failed∨TimedOut;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Error Types⦘
+  ─────────────────────────────────────────────────────────────────
+
+  PermissionErrorType≜
+    FileReadDenied∨FileWriteDenied∨CommandBlocked∨
+    ToolDisabled∨EnvVarMissing∨SecretMissing∨NetworkBlocked;
+
+  PermissionFix≜
+    AddReadPath(PathPattern)∨AddWritePath(PathPattern)∨
+    AllowCommand(String)∨EnableTool(String)∨
+    InjectEnvVar(String)∨InjectSecret(SecretRef)∨
+    CannotFix(String);
+}
+
+⟦Γ:Architecture⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Component Hierarchy⦘
+  ─────────────────────────────────────────────────────────────────
+
+  HostLLM⊃WatcherAgent⊃SandboxedLLM;
+
+  Components≜{
+    SpawnCommand≜"CLI/skill entry point",
+    WatcherAgent≜"Orchestrates spawn lifecycle",
+    SandboxProvider≜"Abstracts isolation mechanism",
+    LLMRunner≜"Launches and streams from target CLI",
+    ProgressMonitor≜"Tracks activity, detects hangs",
+    PermissionDetector≜"Pattern-matches permission errors",
+    PRManager≜"Creates PRs, handles merge conflicts",
+    SecretsManager≜"Secret injection & log redaction"
+  };
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Data Flow⦘
+  ─────────────────────────────────────────────────────────────────
+
+  SpawnFlow≜λreq:SpawnRequest.
+    let manifest≔WatcherAgent.evaluate(req) in
+    let sandbox≔SandboxProvider.create(manifest) in
+    let result≔LLMRunner.execute(sandbox,req.prompt) in
+    PRManager.integrate(result);
+
+  MonitorFlow≜λsandbox:Sandbox.
+    ProgressMonitor.track(sandbox)
+    ⇒(error:PermissionError)⇒PermissionDetector.analyze(error)
+    ⇒(fix:PermissionFix)⇒RecoveryStrategy.apply(fix);
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Isolation Guarantees⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ∀sandbox∈Sandbox:
+    ¬access(sandbox,$HOME)∧
+    ¬access(sandbox,config_files)∧
+    ¬access(sandbox,other_repos);
+
+  ∀llm∈SandboxedLLM:
+    ¬flag(llm,"--dangerously-skip-permissions");
+
+  ∀secret∈Secrets:
+    ¬appears(secret,logs);
+}
+
+⟦Λ:CoreFunctions⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Spawn Operations⦘
+  ─────────────────────────────────────────────────────────────────
+
+  spawn:(SpawnRequest)→Result⟨SpawnResult,SpawnError⟩;
+
+  spawn_team:(SpawnRequest,CoordinationMode)→Result⟨SpawnResult,SpawnError⟩;
+
+  CoordinationMode≜Sequential∨PingPong{max_iterations:ℕ};
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Sandbox Operations⦘
+  ─────────────────────────────────────────────────────────────────
+
+  create_worktree:(GitRepo,Branch)→Result⟨Worktree,GitError⟩;
+
+  destroy_worktree:(Worktree)→Result⟨(),GitError⟩;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Recovery Operations⦘
+  ─────────────────────────────────────────────────────────────────
+
+  detect_permission_error:(Output)→Option⟨PermissionErrorType⟩;
+
+  compute_fix:(PermissionErrorType)→PermissionFix;
+
+  apply_fix:(PermissionFix,SandboxManifest)→Result⟨SandboxManifest,CannotFix⟩;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Integration Operations⦘
+  ─────────────────────────────────────────────────────────────────
+
+  create_pr:(Worktree,Summary)→Result⟨PR,GitError⟩;
+
+  resolve_conflicts:(PR,ConflictStrategy)→Result⟨PR,MergeError⟩;
+
+  ConflictStrategy≜AutoSmall∨SpawnRepair;
+}
+
+⟦Ε:Metrics⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Timeout Thresholds⦘
+  ─────────────────────────────────────────────────────────────────
+
+  idle_timeout.default≔120s;
+  total_timeout.default≔1800s;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Recovery Limits⦘
+  ─────────────────────────────────────────────────────────────────
+
+  max_permission_escalations.moderate≔1;
+  max_permission_escalations.aggressive≔∞;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Spawn-Team Limits⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ping_pong.max_iterations.default≔3;
+}
+
+⟦Χ:ErrorAlgebra⟧{
+  SpawnError≜
+    SandboxCreation(String)∨
+    Permission{kind:PermissionErrorType}∨
+    Timeout{duration:Duration}∨
+    LLMFailure{output:String}∨
+    PRCreation{reason:String};
+
+  ∀e∈SpawnError:
+    recoverable(e)↔(e∈Permission∧fix(e)≠CannotFix);
+}
+
+⟦Refs⟧{
+  CLAUDE.aisp→"./CLAUDE.aisp";
+  AGENTS.aisp→"./agents/watcher.aisp";
+  config.spec→"./docs/configuration.aisp";
+}

@@ -1,0 +1,237 @@
+𝔸5.1.infinite-improbability-drive.agent.watcher@2026-02-01
+γ≔claude-code-plugin:watcher-agent
+
+⟦Ω:Foundation⟧{
+  Agent≜"WatcherAgent";
+  Purpose≜"Orchestrate spawn lifecycle with intelligent monitoring";
+  Ambig(D)<0.02;
+}
+
+⟦Σ:AgentInterface⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Input Types⦘
+  ─────────────────────────────────────────────────────────────────
+
+  WatcherInput≜{
+    request:SpawnRequest,
+    repo:GitRepo,
+    config:SpawnConfig
+  };
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Output Types⦘
+  ─────────────────────────────────────────────────────────────────
+
+  WatcherOutput≜{
+    result:SpawnResult,
+    manifest:SandboxManifest,
+    events:Vec⟨WatcherEvent⟩
+  };
+
+  WatcherEvent≜
+    SandboxCreated{id:UUID}∨
+    LLMStarted{llm:LLMTarget}∨
+    ProgressUpdate{state:ProgressState}∨
+    PermissionError{error:PermissionErrorType,fix:PermissionFix}∨
+    RecoveryAttempt{attempt:ℕ,max:ℕ}∨
+    LLMCompleted{status:SpawnStatus}∨
+    PRCreated{url:URL};
+}
+
+⟦Γ:Behavior⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Lifecycle Phases⦘
+  ─────────────────────────────────────────────────────────────────
+
+  Lifecycle≜[
+    Evaluate→Provision→Execute→Monitor→Recover→Integrate→Report
+  ];
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Evaluate⦘
+  ─────────────────────────────────────────────────────────────────
+
+  evaluate:(SpawnRequest)→SandboxManifest;
+
+  evaluate≜λreq.
+    let complexity≔assess_complexity(req.prompt) in
+    let paths≔infer_paths(req.prompt,repo) in
+    let tools≔infer_tools(req.prompt) in
+    let commands≔infer_commands(req.prompt) in
+    let secrets≔infer_secrets(req.prompt,repo) in
+    SandboxManifest{
+      readable_paths:paths.read,
+      writable_paths:paths.write,
+      allowed_tools:tools,
+      allowed_commands:commands,
+      secrets:secrets,
+      complexity:complexity
+    };
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Provision⦘
+  ─────────────────────────────────────────────────────────────────
+
+  provision:(SandboxManifest,GitRepo)→Result⟨Sandbox,SandboxError⟩;
+
+  provision≜λmanifest,repo.
+    let branch≔create_branch(repo,"spawn/{uuid}") in
+    let worktree≔create_worktree(repo,branch) in
+    let sandbox≔apply_manifest(worktree,manifest) in
+    inject_secrets(sandbox,manifest.secrets);
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Execute⦘
+  ─────────────────────────────────────────────────────────────────
+
+  execute:(Sandbox,SpawnRequest)→StreamHandle;
+
+  execute≜λsandbox,req.
+    let prompt≔mode_convert(req.prompt,req.mode) in
+    let config≔LLMSpawnConfig{
+      cli:req.config.llm,
+      prompt:prompt,
+      worktree_path:sandbox.path,
+      manifest:sandbox.manifest,
+      session_history:false,
+      headless:true,
+      streaming:true
+    } in
+    LLMRunner.spawn(config);
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Monitor⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ProgressState≜{
+    files_read:Set⟨Path⟩,
+    files_written:Set⟨Path⟩,
+    commits_made:Vec⟨CommitInfo⟩,
+    output_lines:ℕ,
+    last_activity:Instant,
+    start_time:Instant,
+    permission_errors:Vec⟨PermissionError⟩,
+    other_errors:Vec⟨String⟩
+  };
+
+  monitor:(StreamHandle)→Stream⟨ProgressState⟩;
+
+  timeout_check:(ProgressState,SpawnConfig)→Option⟨TimeoutType⟩;
+
+  TimeoutType≜Idle∨Total;
+
+  timeout_check≜λstate,config.
+    if now()-state.last_activity>config.idle_timeout then Some(Idle)
+    else if now()-state.start_time>config.total_timeout then Some(Total)
+    else None;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Recover⦘
+  ─────────────────────────────────────────────────────────────────
+
+  recover:(PermissionError,SandboxManifest,RecoveryStrategy)
+    →Result⟨SandboxManifest,RecoveryFailed⟩;
+
+  ⦗Moderate Strategy⦘
+  recover.moderate≜λerror,manifest,attempts.
+    if attempts≥max_permission_escalations then
+      Err(RecoveryFailed)
+    else
+      let fix≔compute_fix(error) in
+      match fix {
+        CannotFix(reason)⇒Err(RecoveryFailed),
+        fix⇒Ok(apply_fix(fix,manifest))
+      };
+
+  ⦗Aggressive Strategy⦘
+  recover.aggressive≜λerror,manifest,_.
+    let fix≔compute_fix(error) in
+    match fix {
+      CannotFix(reason)⇒Err(RecoveryFailed),
+      fix⇒Ok(apply_fix(fix,manifest))
+    };
+
+  ⦗Interactive Strategy⦘
+  recover.interactive≜λerror,manifest,_.
+    let fix≔compute_fix(error) in
+    let approved≔prompt_user(error,fix) in
+    if approved then Ok(apply_fix(fix,manifest))
+    else Err(RecoveryFailed);
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Integrate⦘
+  ─────────────────────────────────────────────────────────────────
+
+  integrate:(Sandbox,ProgressState)→Result⟨PR,IntegrationError⟩;
+
+  integrate≜λsandbox,state.
+    let uncommitted≔detect_uncommitted(sandbox) in
+    if uncommitted then commit_all(sandbox,"WIP: spawn changes") in
+    let pr≔create_pr(sandbox.branch,state.summary) in
+    match detect_conflicts(pr) {
+      None⇒Ok(pr),
+      Some(conflicts) if small(conflicts)⇒auto_resolve(pr,conflicts),
+      Some(conflicts)⇒spawn_repair(pr,conflicts)
+    };
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Phase: Report⦘
+  ─────────────────────────────────────────────────────────────────
+
+  report:(SpawnResult)→Summary;
+
+  SummaryFormat≜"
+## Spawn Complete: {task_name} (spawn-id: {id})
+
+**Status:** {status} ({duration})
+**PR:** #{pr_number} - {pr_url}
+
+### Changes
+{file_changes}
+
+### Summary
+{description}
+
+### Logs
+Debug logs: `.improbability-drive/spawns/{id}/`
+";
+}
+
+⟦Λ:Tools⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Available Tools⦘
+  ─────────────────────────────────────────────────────────────────
+
+  DefaultTools≜{Read,Write,Edit,Glob,Grep,Bash};
+  DeniedTools≜{Task};  // No recursive spawning
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Tool Constraints⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ∀tool∈enabled_tools:tool∈DefaultTools∨explicitly_allowed(tool);
+  ∀tool∈DeniedTools:¬enabled(tool);
+}
+
+⟦Ε:Metrics⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Performance Targets⦘
+  ─────────────────────────────────────────────────────────────────
+
+  evaluation_time<5s;
+  provision_time<10s;
+  pr_creation_time<30s;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Success Criteria⦘
+  ─────────────────────────────────────────────────────────────────
+
+  success_rate≜completed/(completed+failed+timeout);
+  target(success_rate)≥0.85;
+}
+
+⟦Refs⟧{
+  architecture→"../docs/architecture.aisp";
+  permissions→"../docs/permissions.aisp";
+  config→"../docs/configuration.aisp";
+}

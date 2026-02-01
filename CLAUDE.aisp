@@ -1,0 +1,139 @@
+𝔸5.1.infinite-improbability-drive.instructions@2026-02-01
+γ≔claude-code-plugin:development-context
+
+⟦Ω:Foundation⟧{
+  Project≜"infinite-improbability-drive";
+  Purpose≜"Claude Code plugin for spawning sandboxed LLMs";
+  Lang≜Rust;
+  Ambig(D)<0.02;
+}
+
+⟦Σ:Glossary⟧{
+  spawn≜"Launch isolated LLM instance for delegated task";
+  watcher≜"Agent that orchestrates spawn lifecycle";
+  sandbox≜"Isolated execution environment (git worktree)";
+  manifest≜"Permission and resource specification for sandbox";
+  aisp≜"AI-Semantic Protocol for LLM communication";
+  passthrough≜"Direct prompt forwarding without AISP conversion";
+}
+
+⟦Γ:ProjectStructure⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗File Layout⦘
+  ─────────────────────────────────────────────────────────────────
+
+  root/≜{
+    ".claude-plugin/plugin.json"≜"Plugin metadata",
+    "CLAUDE.md"≜"Human instructions",
+    "CLAUDE.aisp"≜"LLM instructions (this file)",
+    "commands/"≜"Slash command definitions",
+    "skills/"≜"Skill definitions",
+    "agents/"≜"Agent definitions",
+    "core/"≜"Rust implementation",
+    "docs/"≜"Documentation (aisp + md)",
+    "tests/"≜"Test suite"
+  };
+
+  "core/src/"≜{
+    "lib.rs"≜"Library root",
+    "main.rs"≜"CLI binary",
+    "spawn.rs"≜"Spawn command logic",
+    "watcher.rs"≜"Watcher agent orchestration",
+    "sandbox/"≜"Sandbox implementations",
+    "runner/"≜"LLM runner implementations",
+    "monitor.rs"≜"Progress tracking",
+    "permissions.rs"≜"Error detection & recovery",
+    "secrets.rs"≜"Secret handling",
+    "pr.rs"≜"PR creation & conflicts"
+  };
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Documentation Layout⦘
+  ─────────────────────────────────────────────────────────────────
+
+  "docs/"≜{
+    "architecture.aisp"≜"System architecture (LLM)",
+    "architecture.md"≜"System architecture (human)",
+    "configuration.aisp"≜"Config specification (LLM)",
+    "configuration.md"≜"Config guide (human)"
+  };
+}
+
+⟦Λ:DevelopmentRules⟧{
+  ─────────────────────────────────────────────────────────────────
+  ⦗Rust Conventions⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ∀error∈CustomError:use(thiserror);
+  ∀async∈Runtime:use(tokio);
+  ∀log∈Logging:use(tracing);
+  ∀api∈Public:documented(api);
+
+  prefer(Result⟨T,E⟩)>panic;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Error Pattern⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ErrorDefinition≜λname:String.
+    "#[derive(Error,Debug)]"∧
+    "pub enum {name}Error"∧
+    variants(descriptive_messages);
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Testing Rules⦘
+  ─────────────────────────────────────────────────────────────────
+
+  unit_tests∈same_file("#[cfg(test)]");
+  integration_tests∈"tests/";
+  filesystem_tests⇒use(tempfile);
+  llm_tests⇒mock_responses;
+
+  ─────────────────────────────────────────────────────────────────
+  ⦗Security Rules⦘
+  ─────────────────────────────────────────────────────────────────
+
+  ∀sandbox:¬allow("--dangerously-skip-permissions");
+  ∀secret:¬log(secret);
+  ∀path∉worktree:¬access(path);
+}
+
+⟦Ε:ImplementationPhases⟧{
+  Phase1≜"Foundation"{
+    □ update(rosetta-aisp-llm,"0.3.0");
+    □ create(plugin_structure);
+    □ impl(SandboxProvider,worktree);
+    □ impl(spawn_command,basic);
+  };
+
+  Phase2≜"Watcher Agent"{
+    □ impl(task_evaluation,llm_assisted);
+    □ impl(progress_monitoring);
+    □ impl(permission_detection);
+  };
+
+  Phase3≜"Recovery & Integration"{
+    □ impl(recovery_strategies);
+    □ impl(pr_creation);
+    □ impl(secret_handling);
+  };
+
+  Phase4≜"Spawn-Team"{
+    □ impl(sequential_coordination);
+    □ impl(ping_pong_mode);
+    □ impl(gemini_runner);
+  };
+
+  Phase5≜"Polish"{
+    □ write(documentation);
+    □ write(tests);
+    □ impl(config_validation);
+  };
+}
+
+⟦Refs⟧{
+  architecture→"./docs/architecture.aisp";
+  agents→"./agents/watcher.aisp";
+  config→"./docs/configuration.aisp";
+  human_docs→"./docs/architecture.md";
+}
