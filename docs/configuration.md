@@ -192,14 +192,68 @@ Configuration values are resolved in this order (highest priority first):
 
 ## Validation Rules
 
-The configuration system enforces these constraints:
+Configuration is validated before spawning using the `config` module. The `Validate` trait provides validation for all configuration types.
 
-- `idle_timeout` must be greater than 0
-- `total_timeout` must be greater than `idle_timeout`
-- `max_permission_escalations` must be non-negative
-- `max_iterations` must be at least 1
-- `allowed_tools` and `denied_tools` must not overlap
-- All tool names must be valid
+### Validation API
+
+```rust
+use improbability_drive::{validate_spawn_operation, Validate};
+
+// Validate individual configs
+let result = spawn_config.validate();
+if !result.is_valid() {
+    eprintln!("Errors: {:?}", result.errors);
+}
+for warning in result.warnings {
+    eprintln!("Warning: {}", warning);
+}
+
+// Validate combined spawn operation
+let result = validate_spawn_operation(&spawn_config, &manifest);
+let warnings = result.into_result()?; // Returns Err if any errors
+```
+
+### Errors (Fatal)
+
+These issues prevent spawning:
+
+| Condition | Message |
+|-----------|---------|
+| Empty prompt | `"prompt cannot be empty"` |
+| Whitespace-only prompt | `"prompt cannot be empty"` |
+| `idle_timeout >= total_timeout` | `"idle_timeout must be less than total_timeout"` |
+| `max_iterations == 0` | `"max_iterations must be at least 1"` |
+
+### Warnings (Informational)
+
+These issues generate warnings but allow spawning:
+
+| Condition | Message |
+|-----------|---------|
+| `idle_timeout < 10s` | May cause premature termination |
+| `total_timeout > 2h` | May indicate misconfiguration |
+| Unknown tool name | `"unknown tool 'X' in allowed_tools"` |
+| Recursive glob in paths | Consider being more specific |
+| Sensitive write paths (`/etc`, `.ssh`) | Security warning |
+| `max_escalations > 10` | May indicate insufficient initial permissions |
+| `max_escalations == 0` | No automatic permission fixes |
+| Unknown LLM identifier | `"unknown primary_llm 'X'"` |
+| Same primary/reviewer LLM | May limit review value |
+| `max_iterations > 10` | May lead to excessive LLM calls |
+
+### Known Identifiers
+
+```rust
+// Known LLM runners
+pub const KNOWN_LLMS: &[&str] = &["claude-code", "gemini-cli"];
+
+// Known tool names
+pub const KNOWN_TOOLS: &[&str] = &[
+    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    "LS", "Task", "WebFetch", "WebSearch",
+    "NotebookEdit", "NotebookRead",
+];
+```
 
 ## Related Documentation
 
