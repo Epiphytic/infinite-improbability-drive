@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod cruise;
+pub mod e2e;
 pub mod error;
 pub mod monitor;
 pub mod permissions;
@@ -29,6 +30,8 @@ pub use team::{
     ReviewVerdict, SpawnTeamConfig, SpawnTeamResult,
 };
 pub use watcher::{RecoveryStrategy, TerminationReason, WatcherAgent, WatcherConfig, WatcherResult};
+
+pub use e2e::{E2EHarness, E2EResult, Fixture, RunnerType, ValidationLevel};
 
 pub use config::{
     validate_spawn_operation, validate_spawn_team_operation, Validate, ValidationResult,
