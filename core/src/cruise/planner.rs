@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::task::{CruisePlan, CruiseTask, TaskComplexity};
+use crate::error::{Error, Result};
+
 /// Review phase for plan iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +63,96 @@ impl ReviewPhase {
     }
 }
 
+/// Intermediate struct for parsing plan JSON.
+#[derive(Debug, Deserialize)]
+struct PlanJson {
+    title: String,
+    overview: String,
+    tasks: Vec<TaskJson>,
+    #[serde(default)]
+    risks: Vec<String>,
+}
+
+/// Intermediate struct for parsing task JSON.
+#[derive(Debug, Deserialize)]
+struct TaskJson {
+    id: String,
+    subject: String,
+    description: String,
+    #[serde(default)]
+    blocked_by: Vec<String>,
+    #[serde(default)]
+    component: Option<String>,
+    #[serde(default = "default_complexity")]
+    complexity: String,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+}
+
+fn default_complexity() -> String {
+    "medium".to_string()
+}
+
+/// Parses plan JSON from LLM output.
+///
+/// Extracts JSON from the output (may be wrapped in markdown code blocks)
+/// and parses it into a CruisePlan.
+pub fn parse_plan_json(output: &str) -> Result<CruisePlan> {
+    // Try to find JSON in the output
+    let json_str =
+        extract_json(output).ok_or_else(|| Error::Cruise("No JSON found in output".to_string()))?;
+
+    // Parse the JSON
+    let parsed: PlanJson = serde_json::from_str(json_str)
+        .map_err(|e| Error::Cruise(format!("Failed to parse plan JSON: {}", e)))?;
+
+    // Convert to CruisePlan
+    let mut plan = CruisePlan::new("");
+    plan.title = parsed.title;
+    plan.overview = parsed.overview;
+    plan.risks = parsed.risks;
+
+    for task_json in parsed.tasks {
+        let complexity = match task_json.complexity.to_lowercase().as_str() {
+            "low" => TaskComplexity::Low,
+            "high" => TaskComplexity::High,
+            _ => TaskComplexity::Medium,
+        };
+
+        let mut task = CruiseTask::new(&task_json.id, &task_json.subject)
+            .with_description(&task_json.description)
+            .with_blocked_by(task_json.blocked_by)
+            .with_complexity(complexity);
+
+        task.component = task_json.component;
+        task.acceptance_criteria = task_json.acceptance_criteria;
+
+        plan.tasks.push(task);
+    }
+
+    Ok(plan)
+}
+
+/// Extracts JSON from output that may contain markdown code blocks.
+fn extract_json(output: &str) -> Option<&str> {
+    // Try to find JSON in code block
+    if let Some(start) = output.find("```json") {
+        let json_start = start + 7;
+        if let Some(end) = output[json_start..].find("```") {
+            return Some(output[json_start..json_start + end].trim());
+        }
+    }
+
+    // Try to find raw JSON
+    let json_start = output.find('{')?;
+    let json_end = output.rfind('}')?;
+    if json_start < json_end {
+        Some(&output[json_start..=json_end])
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +196,85 @@ mod tests {
             serde_json::to_string(&ReviewPhase::TechnicalFeasibility).unwrap(),
             "\"technical_feasibility\""
         );
+    }
+
+    #[test]
+    fn parse_plan_json_extracts_from_code_block() {
+        let output = r#"
+Here's my plan:
+```json
+{
+    "title": "REST API",
+    "overview": "Build a REST API",
+    "tasks": [
+        {
+            "id": "CRUISE-001",
+            "subject": "Setup project",
+            "description": "Create initial structure",
+            "blocked_by": [],
+            "component": "infrastructure",
+            "complexity": "low",
+            "acceptance_criteria": ["Cargo.toml exists"]
+        }
+    ],
+    "risks": ["Tight deadline"]
+}
+```
+"#;
+
+        let plan = parse_plan_json(output).unwrap();
+        assert_eq!(plan.title, "REST API");
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].id, "CRUISE-001");
+        assert_eq!(plan.tasks[0].complexity, TaskComplexity::Low);
+        assert_eq!(plan.risks, vec!["Tight deadline"]);
+    }
+
+    #[test]
+    fn parse_plan_json_extracts_raw_json() {
+        let output = r#"{"title": "Test", "overview": "Test plan", "tasks": []}"#;
+
+        let plan = parse_plan_json(output).unwrap();
+        assert_eq!(plan.title, "Test");
+        assert!(plan.tasks.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_json_handles_missing_optional_fields() {
+        let output = r#"{
+            "title": "Minimal",
+            "overview": "Minimal plan",
+            "tasks": [
+                {
+                    "id": "CRUISE-001",
+                    "subject": "Task",
+                    "description": "Do something"
+                }
+            ]
+        }"#;
+
+        let plan = parse_plan_json(output).unwrap();
+        assert_eq!(plan.tasks[0].complexity, TaskComplexity::Medium);
+        assert!(plan.tasks[0].blocked_by.is_empty());
+        assert!(plan.risks.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_json_returns_error_for_invalid_json() {
+        let output = "not json at all";
+        let result = parse_plan_json(output);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_json_finds_code_block() {
+        let output = "text ```json\n{\"a\": 1}\n``` more";
+        assert_eq!(extract_json(output), Some("{\"a\": 1}"));
+    }
+
+    #[test]
+    fn extract_json_finds_raw_json() {
+        let output = "prefix {\"a\": 1} suffix";
+        assert_eq!(extract_json(output), Some("{\"a\": 1}"));
     }
 }
