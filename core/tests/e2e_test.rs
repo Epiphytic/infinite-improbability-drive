@@ -10,6 +10,7 @@
 //!
 //! Environment variables:
 //! - `E2E_DELETE_ON_SUCCESS=1` - Delete repos even on success
+//! - `E2E_KEEP_REPOS=1` - Keep all repos for inspection (overrides other settings)
 
 use std::path::PathBuf;
 
@@ -23,13 +24,24 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn create_harness() -> E2EHarness {
-    let delete_on_success = std::env::var("E2E_DELETE_ON_SUCCESS")
+    // E2E_KEEP_REPOS=1 overrides all deletion settings
+    let keep_all = std::env::var("E2E_KEEP_REPOS")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
 
+    let delete_on_success = if keep_all {
+        false
+    } else {
+        std::env::var("E2E_DELETE_ON_SUCCESS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false)
+    };
+
+    let delete_on_failure = !keep_all;
+
     let config = E2EConfig::new("epiphytic")
         .with_delete_on_success(delete_on_success)
-        .with_delete_on_failure(true);
+        .with_delete_on_failure(delete_on_failure);
 
     E2EHarness::with_config(config)
 }
