@@ -29,6 +29,22 @@ pub enum Error {
     /// Spawn configuration error.
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// Cruise-control operation failed.
+    #[error("cruise-control error: {0}")]
+    Cruise(String),
+
+    /// GitHub API operation failed.
+    #[error("GitHub operation failed: {0}")]
+    GitHub(String),
+
+    /// Plan approval timeout.
+    #[error("plan approval timed out after {0} seconds")]
+    ApprovalTimeout(u64),
+
+    /// Dependency cycle detected in plan.
+    #[error("dependency cycle detected: {0}")]
+    DependencyCycle(String),
 }
 
 /// Result type alias for spawn operations.
