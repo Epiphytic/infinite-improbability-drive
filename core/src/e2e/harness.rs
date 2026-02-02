@@ -14,6 +14,8 @@ use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::WorktreeSandbox;
 use crate::spawn::{SpawnConfig, SpawnResult, Spawner};
+use crate::team::SpawnTeamResult;
+use crate::team_orchestrator::SpawnObservability;
 
 use super::fixture::{Fixture, RunnerType, WorkflowType};
 use super::repo::EphemeralRepo;
@@ -94,6 +96,10 @@ pub struct E2EResult {
     pub repo_name: Option<String>,
     /// Whether the repository was deleted.
     pub repo_deleted: bool,
+    /// Observability data from spawn-team (if used).
+    pub observability: Option<SpawnObservability>,
+    /// Spawn-team result (if used).
+    pub spawn_team_result: Option<SpawnTeamResult>,
 }
 
 /// E2E test harness.
@@ -141,6 +147,8 @@ impl E2EHarness {
                     plan_pr_url: None,
                     repo_name: None,
                     repo_deleted: false,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
@@ -190,6 +198,8 @@ impl E2EHarness {
                     plan_pr_url: None,
                     repo_name: Some(repo_name),
                     repo_deleted: self.config.delete_on_failure,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
@@ -235,6 +245,8 @@ impl E2EHarness {
                     plan_pr_url: None,
                     repo_name: Some(repo_name),
                     repo_deleted: self.config.delete_on_failure,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
@@ -291,6 +303,8 @@ impl E2EHarness {
             plan_pr_url: None,
             repo_name: Some(repo_name),
             repo_deleted,
+            observability: None,
+            spawn_team_result: None,
         }
     }
 
@@ -313,6 +327,8 @@ impl E2EHarness {
                     plan_pr_url: None,
                     repo_name: None,
                     repo_deleted: false,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
@@ -363,13 +379,17 @@ impl E2EHarness {
                     plan_pr_url: None,
                     repo_name: Some(repo_name),
                     repo_deleted: self.config.delete_on_failure,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
 
-        // Create beads issues from plan output
+        // Create beads issues from plan output (in the SANDBOX so they're part of the plan PR)
         let plan_issues = if let Some(ref sandbox_path) = plan_sandbox_path {
-            match self.extract_and_create_beads_issues(sandbox_path, repo.path()) {
+            // Pass sandbox_path as both the plan source AND the beads target
+            // This way beads issues are created in the sandbox and will be part of the plan PR
+            match self.extract_and_create_beads_issues(sandbox_path, sandbox_path) {
                 Ok(issues) => {
                     tracing::info!(issue_count = issues.len(), "created beads issues from plan");
                     issues
@@ -445,6 +465,8 @@ impl E2EHarness {
                     plan_pr_url,
                     repo_name: Some(repo_name),
                     repo_deleted: self.config.delete_on_failure,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
@@ -478,6 +500,8 @@ impl E2EHarness {
                     plan_pr_url,
                     repo_name: Some(repo_name),
                     repo_deleted: self.config.delete_on_failure,
+                    observability: None,
+                    spawn_team_result: None,
                 };
             }
         };
@@ -538,6 +562,8 @@ impl E2EHarness {
             plan_pr_url,
             repo_name: Some(repo_name),
             repo_deleted,
+            observability: None,
+            spawn_team_result: None,
         }
     }
 
@@ -643,20 +669,34 @@ impl E2EHarness {
     ) -> Option<String> {
         let pr_manager = PRManager::new(repo_path.clone());
 
-        // Commit changes in sandbox
+        // Commit changes in sandbox (if any uncommitted)
         let commit_message = format!("E2E test: {}\n\nSpawn ID: {}", fixture_name, spawn_id);
         match pr_manager.commit_changes(sandbox_path, &commit_message) {
             Ok(Some(hash)) => {
                 tracing::info!(hash = %hash, "committed changes");
             }
             Ok(None) => {
-                tracing::info!("no changes to commit");
-                return None;
+                // No uncommitted changes, but LLM may have already committed
+                tracing::debug!("no uncommitted changes, checking for existing commits");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to commit changes");
                 return None;
             }
+        }
+
+        // Check if we have any commits ahead of main (including LLM commits)
+        let commits_ahead = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-list", "--count", "main..HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+            .unwrap_or(0);
+
+        if commits_ahead == 0 {
+            tracing::info!("no commits to create PR for");
+            return None;
         }
 
         // Get branch name from sandbox path
@@ -749,16 +789,22 @@ impl E2EHarness {
             r#"<!-- E2E_HARNESS_PLANNING_PHASE: This plan is generated by the E2E test harness using the cruise-control planning module -->
 <!-- BEADS_INTEGRATION: Issues will be created from this plan and tracked in .beads/ -->
 
-Create a detailed implementation plan for the following task.
+**THIS IS A PLANNING-ONLY PHASE. DO NOT IMPLEMENT ANYTHING.**
 
-Output your plan in two parts:
+Create a detailed implementation plan for the following task and SAVE IT TO A FILE.
 
-1. First, create a markdown document with:
-   - A header that includes: `[E2E Test Plan - Cruise-Control Module Active]`
-   - Overview section explaining the approach
-   - Risk Areas section listing potential issues
+**CRITICAL INSTRUCTIONS:**
+1. You MUST create a file called `PLAN.md` at the root of the repository.
+2. You MUST NOT create any implementation files (no Cargo.toml, no src/, no tests/).
+3. You MUST NOT implement the task - only plan it.
+4. You MUST NOT make any commits - the harness will commit your changes.
 
-2. Then, output a JSON block with the tasks in this exact format:
+The PLAN.md file must contain:
+
+1. A header that includes: `[E2E Test Plan - Cruise-Control Module Active]`
+2. An Overview section explaining the approach
+3. A Risk Areas section listing potential issues
+4. A JSON block with the tasks in this exact format:
 
 ```json
 {{
@@ -778,9 +824,11 @@ Output your plan in two parts:
 }}
 ```
 
-Use CRUISE-XXX IDs. List dependencies in blocked_by using task IDs.
+Use CRUISE-XXX IDs (e.g., CRUISE-001, CRUISE-002). List dependencies in blocked_by using task IDs.
 
-Task: {}"#,
+**REMEMBER: ONLY create PLAN.md. Do NOT implement the code. Do NOT commit.**
+
+Task to plan (do NOT implement): {}"#,
             prompt
         )
     }
@@ -791,22 +839,37 @@ Task: {}"#,
         sandbox_path: &PathBuf,
         repo_path: &PathBuf,
     ) -> Result<Vec<PlanIssue>, String> {
+        tracing::debug!(sandbox_path = ?sandbox_path, repo_path = ?repo_path, "extracting plan and creating beads issues");
+
         // Look for plan files in the sandbox
         let plan_content = self
             .find_and_read_plan(sandbox_path)
             .map_err(|e| format!("failed to find plan: {}", e))?;
 
+        tracing::debug!(content_len = plan_content.len(), "found plan content");
+
         // Try to parse as CruisePlan
         let plan = match parse_plan_json(&plan_content) {
-            Ok(p) => p,
+            Ok(p) => {
+                tracing::info!(title = %p.title, task_count = p.tasks.len(), "parsed plan JSON");
+                p
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "could not parse plan JSON, skipping beads issue creation");
+                tracing::warn!(error = %e, "could not parse plan JSON");
                 return Err(format!("could not parse plan: {}", e));
             }
         };
 
         // Create beads issues
         let beads = BeadsClient::new(repo_path);
+
+        // Check if beads is initialized
+        if !beads.is_initialized() {
+            if let Err(e) = beads.init() {
+                return Err(format!("failed to init beads: {}", e));
+            }
+        }
+
         let mut created_issues = Vec::new();
         let mut id_mapping: HashMap<String, String> = HashMap::new();
 
@@ -831,15 +894,8 @@ Task: {}"#,
 
             match beads.create(&task.subject, options) {
                 Ok(result) => {
-                    tracing::info!(
-                        beads_id = %result.id,
-                        plan_id = %task.id,
-                        subject = %task.subject,
-                        "created beads issue"
-                    );
-
+                    tracing::debug!(beads_id = %result.id, plan_id = %task.id, "created beads issue");
                     id_mapping.insert(task.id.clone(), result.id.clone());
-
                     created_issues.push(PlanIssue {
                         beads_id: result.id,
                         plan_task_id: task.id.clone(),
@@ -847,11 +903,7 @@ Task: {}"#,
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        task_id = %task.id,
-                        "failed to create beads issue"
-                    );
+                    tracing::warn!(error = %e, task_id = %task.id, "failed to create beads issue");
                 }
             }
         }
@@ -878,8 +930,23 @@ Task: {}"#,
             }
         }
 
-        // Commit the beads issue creation
+        // Export beads database to JSONL before committing
         if !created_issues.is_empty() {
+            // Export the database to issues.jsonl file
+            let jsonl_path = repo_path.join(".beads/issues.jsonl");
+            let export_output = Command::new("bd")
+                .current_dir(repo_path)
+                .args(["export", "-o", jsonl_path.to_str().unwrap_or(".beads/issues.jsonl")])
+                .output();
+
+            if let Ok(output) = &export_output {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(error = %stderr, "beads export failed");
+                }
+            }
+
+            // Commit the beads issue creation
             let _ = commit_issue_change(
                 repo_path,
                 "plan",
@@ -900,6 +967,20 @@ Task: {}"#,
             sandbox_path.clone(),
         ];
 
+        // First, check for specifically named PLAN.md or plan.md in any location
+        for dir in &plan_paths {
+            for plan_name in ["PLAN.md", "plan.md", "Plan.md"] {
+                let plan_file = dir.join(plan_name);
+                if plan_file.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&plan_file) {
+                        tracing::debug!(plan_file = ?plan_file, content_len = content.len(), "found plan file");
+                        return Ok(content);
+                    }
+                }
+            }
+        }
+
+        // Fall back to searching for any .md file with plan markers
         for dir in &plan_paths {
             if dir.exists() && dir.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(dir) {
@@ -908,6 +989,7 @@ Task: {}"#,
                         if path.extension().map(|e| e == "md").unwrap_or(false) {
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 if content.contains("CRUISE-") || content.contains("```json") {
+                                    tracing::debug!(path = ?path, "found plan file with markers");
                                     return Ok(content);
                                 }
                             }

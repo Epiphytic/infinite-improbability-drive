@@ -14,6 +14,8 @@ use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::{SandboxManifest, SandboxProvider};
 use crate::spawn::{SpawnConfig, SpawnResult, SpawnStatus, Spawner};
+use crate::team::{CoordinationMode, SpawnTeamConfig};
+use crate::team_orchestrator::{format_observability_markdown, SpawnTeamOrchestrator};
 
 use super::config::CruiseConfig;
 use super::planner::generate_pr_body as generate_plan_pr_body;
@@ -60,6 +62,8 @@ pub struct CruiseRunner<P: SandboxProvider + Clone> {
     logs_dir: PathBuf,
     /// Auto-approve PRs (useful for testing)
     auto_approve: bool,
+    /// Use spawn-team ping-pong mode with Gemini reviews
+    use_spawn_team: bool,
 }
 
 impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
@@ -70,7 +74,14 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             provider,
             logs_dir,
             auto_approve: false,
+            use_spawn_team: false,
         }
+    }
+
+    /// Enables spawn-team mode with Gemini reviews.
+    pub fn with_spawn_team(mut self, enabled: bool) -> Self {
+        self.use_spawn_team = enabled;
+        self
     }
 
     /// Sets the cruise configuration.
@@ -121,6 +132,7 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
                 duration: spawn_result.duration,
                 completed_count: if success { 1 } else { 0 },
                 blocked_count: 0,
+                observability: None, // Simple workflow doesn't use spawn-team
             }),
             validation_result: None,
             total_duration: start.elapsed(),
@@ -271,10 +283,149 @@ Task: {}"#,
     }
 
     /// Runs the planning phase, creates beads issues, and creates a plan PR.
+    ///
+    /// When spawn-team is enabled, uses ping-pong mode with Gemini reviews.
     async fn run_planning_phase(
         &self,
         planning_prompt: &str,
-        runner_type: RunnerType,
+        _runner_type: RunnerType, // Always uses Claude for planning, Gemini for review
+        timeout: Duration,
+        repo_path: &PathBuf,
+        original_prompt: &str,
+    ) -> Result<(PlanResult, Vec<PlanIssue>)> {
+        let start = Instant::now();
+
+        if self.use_spawn_team {
+            // Use SpawnTeamOrchestrator for planning with Gemini reviews
+            self.run_planning_phase_with_team(planning_prompt, timeout, repo_path, original_prompt)
+                .await
+        } else {
+            // Simple single-spawn planning
+            self.run_planning_phase_simple(planning_prompt, timeout, repo_path, original_prompt)
+                .await
+                .map(|(result, issues)| {
+                    let elapsed = start.elapsed();
+                    (
+                        PlanResult {
+                            duration: elapsed,
+                            ..result
+                        },
+                        issues,
+                    )
+                })
+        }
+    }
+
+    /// Runs planning phase with spawn-team ping-pong mode.
+    ///
+    /// Uses Claude to create the plan and Gemini to review it iteratively.
+    async fn run_planning_phase_with_team(
+        &self,
+        planning_prompt: &str,
+        timeout: Duration,
+        repo_path: &PathBuf,
+        original_prompt: &str,
+    ) -> Result<(PlanResult, Vec<PlanIssue>)> {
+        let start = Instant::now();
+
+        // Configure spawn-team for planning
+        let team_config = SpawnTeamConfig {
+            mode: CoordinationMode::PingPong,
+            max_iterations: self.config.planning.ping_pong_iterations,
+            primary_llm: "claude-code".to_string(),
+            reviewer_llm: "gemini-cli".to_string(),
+        };
+
+        let mut orchestrator = SpawnTeamOrchestrator::new(
+            self.provider.clone(),
+            self.logs_dir.join("planning-team"),
+        )
+        .with_config(team_config);
+
+        // Run the orchestrator
+        // Note: The orchestrator creates its own sandboxes internally.
+        // We use repo_path for reference operations like beads issue creation.
+        let team_result = orchestrator
+            .run(planning_prompt, timeout, repo_path)
+            .await?;
+
+        // Get observability data from orchestrator
+        let observability = orchestrator.take_observability();
+
+        tracing::info!(
+            iterations = team_result.iterations,
+            reviews = team_result.reviews.len(),
+            success = team_result.success,
+            "spawn-team planning completed"
+        );
+
+        // For now, we need to get the sandbox_path from the last spawn
+        // This is a limitation - we should track this in the orchestrator
+        // For observability, we'll use the command_lines to identify the work directory
+        let sandbox_path = observability
+            .command_lines
+            .last()
+            .map(|cmd| cmd.work_dir.clone());
+
+        let mut plan_issues = Vec::new();
+        let mut task_count = 0;
+
+        // Create beads issues from plan if successful
+        if team_result.success {
+            if let Some(ref sandbox) = sandbox_path {
+                match self.extract_and_create_beads_issues(sandbox, repo_path) {
+                    Ok(issues) => {
+                        task_count = issues.len();
+                        plan_issues = issues;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to create beads issues from plan");
+                    }
+                }
+            }
+        }
+
+        // Create plan PR if successful
+        let pr_url = if team_result.success {
+            if let Some(ref sandbox) = sandbox_path {
+                // Include observability in the PR body
+                self.create_plan_pr_with_observability(
+                    sandbox,
+                    repo_path,
+                    original_prompt,
+                    task_count,
+                    &observability,
+                    team_result.iterations,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let plan_result = PlanResult {
+            success: team_result.success,
+            iterations: team_result.iterations,
+            task_count,
+            pr_url,
+            duration: start.elapsed(),
+            plan_file: None,
+            error: if team_result.success {
+                None
+            } else {
+                Some(team_result.summary)
+            },
+            observability: Some(observability),
+        };
+
+        Ok((plan_result, plan_issues))
+    }
+
+    /// Simple planning phase without spawn-team (single spawn).
+    async fn run_planning_phase_simple(
+        &self,
+        planning_prompt: &str,
         timeout: Duration,
         repo_path: &PathBuf,
         original_prompt: &str,
@@ -284,9 +435,9 @@ Task: {}"#,
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("planning"));
         let config = SpawnConfig::new(planning_prompt).with_total_timeout(timeout);
         let manifest = SandboxManifest::default();
-        let runner = runner_type.create_runner();
+        let runner = ClaudeRunner::new();
 
-        let spawn_result = spawner.spawn(config, manifest, runner).await?;
+        let spawn_result = spawner.spawn(config, manifest, Box::new(runner)).await?;
         let success = spawn_result.status == SpawnStatus::Success;
 
         let mut plan_issues = Vec::new();
@@ -295,7 +446,6 @@ Task: {}"#,
         // Create beads issues from plan if successful
         if success {
             if let Some(ref sandbox_path) = spawn_result.sandbox_path {
-                // Try to parse plan and create issues
                 match self.extract_and_create_beads_issues(sandbox_path, repo_path) {
                     Ok(issues) => {
                         task_count = issues.len();
@@ -331,9 +481,71 @@ Task: {}"#,
             } else {
                 Some(spawn_result.summary)
             },
+            observability: None,
         };
 
         Ok((plan_result, plan_issues))
+    }
+
+    /// Creates a plan PR with observability data included.
+    fn create_plan_pr_with_observability(
+        &self,
+        sandbox_path: &PathBuf,
+        repo_path: &PathBuf,
+        prompt: &str,
+        task_count: usize,
+        observability: &crate::team_orchestrator::SpawnObservability,
+        iterations: u32,
+    ) -> Option<String> {
+        let pr_manager = PRManager::new(repo_path.clone());
+
+        // Commit changes
+        let commit_message = format!(
+            "Plan: {}\n\nCreated {} tasks after {} iteration(s)",
+            truncate_string(prompt, 50),
+            task_count,
+            iterations
+        );
+
+        if pr_manager
+            .commit_changes(sandbox_path, &commit_message)
+            .ok()?
+            .is_none()
+        {
+            tracing::info!("no plan changes to commit");
+            return None;
+        }
+
+        // Get branch name
+        let branch_name = sandbox_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("plan");
+
+        // Push branch
+        if pr_manager.push_branch(sandbox_path, branch_name).is_err() {
+            return None;
+        }
+
+        // Create a plan for the PR body
+        let mut plan = CruisePlan::new(prompt);
+        plan.title = format!("Implementation Plan ({} tasks)", task_count);
+        let mut pr_body = generate_plan_pr_body(&plan, prompt, iterations);
+
+        // Append observability section
+        pr_body.push_str("\n\n---\n\n");
+        pr_body.push_str(&format_observability_markdown(observability));
+
+        // Create PR
+        pr_manager
+            .create_pr(
+                &format!("Plan: {}", truncate_string(prompt, 50)),
+                &pr_body,
+                branch_name,
+                "main",
+            )
+            .ok()
+            .map(|pr| pr.url)
     }
 
     /// Extracts plan from spawn output and creates beads issues.
@@ -531,10 +743,110 @@ Task: {}"#,
     }
 
     /// Runs the execution phase, closes beads issues, and creates an implementation PR.
+    ///
+    /// When spawn-team is enabled, uses ping-pong mode with Gemini reviews.
     async fn run_execution_phase(
         &self,
         prompt: &str,
-        runner_type: RunnerType,
+        _runner_type: RunnerType, // Always uses Claude for execution, Gemini for review
+        timeout: Duration,
+        repo_path: &PathBuf,
+        plan_issues: &[PlanIssue],
+    ) -> Result<BuildResult> {
+        if self.use_spawn_team {
+            self.run_execution_phase_with_team(prompt, timeout, repo_path, plan_issues)
+                .await
+        } else {
+            self.run_execution_phase_simple(prompt, timeout, repo_path, plan_issues)
+                .await
+        }
+    }
+
+    /// Runs execution phase with spawn-team ping-pong mode.
+    ///
+    /// Uses Claude to implement and Gemini to review iteratively.
+    async fn run_execution_phase_with_team(
+        &self,
+        prompt: &str,
+        timeout: Duration,
+        repo_path: &PathBuf,
+        plan_issues: &[PlanIssue],
+    ) -> Result<BuildResult> {
+        let start = Instant::now();
+
+        // Configure spawn-team for execution
+        let team_config = SpawnTeamConfig {
+            mode: CoordinationMode::PingPong,
+            max_iterations: self.config.planning.ping_pong_iterations, // Reuse planning iterations
+            primary_llm: "claude-code".to_string(),
+            reviewer_llm: "gemini-cli".to_string(),
+        };
+
+        let mut orchestrator = SpawnTeamOrchestrator::new(
+            self.provider.clone(),
+            self.logs_dir.join("execution-team"),
+        )
+        .with_config(team_config);
+
+        // Run the orchestrator
+        let team_result = orchestrator.run(prompt, timeout, repo_path).await?;
+
+        // Get observability data from orchestrator
+        let observability = orchestrator.take_observability();
+
+        tracing::info!(
+            iterations = team_result.iterations,
+            reviews = team_result.reviews.len(),
+            success = team_result.success,
+            "spawn-team execution completed"
+        );
+
+        // Get sandbox_path from observability
+        let sandbox_path = observability
+            .command_lines
+            .last()
+            .map(|cmd| cmd.work_dir.clone());
+
+        // Close beads issues and create individual commits
+        let task_results = if team_result.success {
+            self.close_beads_issues(repo_path, plan_issues)
+        } else {
+            vec![]
+        };
+
+        let completed_count = task_results
+            .iter()
+            .filter(|r| r.status == TaskStatus::Completed)
+            .count();
+
+        // Create implementation PR if successful
+        if team_result.success {
+            if let Some(ref sandbox) = sandbox_path {
+                self.create_implementation_pr_with_observability(
+                    sandbox,
+                    repo_path,
+                    prompt,
+                    &observability,
+                    team_result.iterations,
+                );
+            }
+        }
+
+        Ok(BuildResult {
+            success: team_result.success,
+            task_results,
+            max_parallelism: 1,
+            duration: start.elapsed(),
+            completed_count,
+            blocked_count: 0,
+            observability: Some(observability),
+        })
+    }
+
+    /// Simple execution phase without spawn-team (single spawn).
+    async fn run_execution_phase_simple(
+        &self,
+        prompt: &str,
         timeout: Duration,
         repo_path: &PathBuf,
         plan_issues: &[PlanIssue],
@@ -544,9 +856,9 @@ Task: {}"#,
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("execution"));
         let config = SpawnConfig::new(prompt).with_total_timeout(timeout);
         let manifest = SandboxManifest::default();
-        let runner = runner_type.create_runner();
+        let runner = ClaudeRunner::new();
 
-        let spawn_result = spawner.spawn(config, manifest, runner).await?;
+        let spawn_result = spawner.spawn(config, manifest, Box::new(runner)).await?;
         let success = spawn_result.status == SpawnStatus::Success;
 
         // Close beads issues and create individual commits
@@ -575,7 +887,76 @@ Task: {}"#,
             duration: start.elapsed(),
             completed_count,
             blocked_count: 0,
+            observability: None,
         })
+    }
+
+    /// Creates an implementation PR with observability data included.
+    fn create_implementation_pr_with_observability(
+        &self,
+        sandbox_path: &PathBuf,
+        repo_path: &PathBuf,
+        prompt: &str,
+        observability: &crate::team_orchestrator::SpawnObservability,
+        iterations: u32,
+    ) -> Option<String> {
+        let pr_manager = PRManager::new(repo_path.clone());
+
+        // Commit changes
+        let commit_message = format!(
+            "Implement: {}\n\nCompleted after {} iteration(s)",
+            truncate_string(prompt, 50),
+            iterations
+        );
+
+        if pr_manager
+            .commit_changes(sandbox_path, &commit_message)
+            .ok()?
+            .is_none()
+        {
+            tracing::info!("no implementation changes to commit");
+            return None;
+        }
+
+        // Get branch name
+        let branch_name = sandbox_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("implementation");
+
+        // Push branch
+        if pr_manager.push_branch(sandbox_path, branch_name).is_err() {
+            return None;
+        }
+
+        // Get commits and file changes for enhanced PR body
+        let commits = get_branch_commits(sandbox_path, branch_name, "main").unwrap_or_default();
+        let files_changed =
+            get_file_changes(sandbox_path, branch_name, "main").unwrap_or_default();
+
+        // Generate enhanced PR body
+        let mut pr_body = pr_manager.generate_enhanced_pr_body(
+            prompt,
+            &format!("Implementation completed after {} iteration(s)", iterations),
+            &commits,
+            &files_changed,
+            &format!("spawn-team-{}-iterations", iterations),
+        );
+
+        // Append observability section
+        pr_body.push_str("\n\n---\n\n");
+        pr_body.push_str(&format_observability_markdown(observability));
+
+        // Create PR
+        pr_manager
+            .create_pr(
+                &format!("Implement: {}", truncate_string(prompt, 50)),
+                &pr_body,
+                branch_name,
+                "main",
+            )
+            .ok()
+            .map(|pr| pr.url)
     }
 
     /// Closes beads issues with individual commits for each.
@@ -822,6 +1203,21 @@ mod tests {
         let runner =
             CruiseRunner::new(provider, PathBuf::from("/tmp/logs")).with_auto_approve(true);
         assert!(runner.auto_approve);
+    }
+
+    #[test]
+    fn cruise_runner_with_spawn_team() {
+        let provider = WorktreeSandbox::new(PathBuf::from("/tmp"), None);
+        let runner =
+            CruiseRunner::new(provider, PathBuf::from("/tmp/logs")).with_spawn_team(true);
+        assert!(runner.use_spawn_team);
+    }
+
+    #[test]
+    fn cruise_runner_spawn_team_default_false() {
+        let provider = WorktreeSandbox::new(PathBuf::from("/tmp"), None);
+        let runner = CruiseRunner::new(provider, PathBuf::from("/tmp/logs"));
+        assert!(!runner.use_spawn_team);
     }
 
     #[test]

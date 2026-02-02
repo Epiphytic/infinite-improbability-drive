@@ -124,6 +124,7 @@ impl Planner {
             duration: start.elapsed(),
             plan_file: None,
             error: Some("Planner not yet integrated with spawn-team".to_string()),
+            observability: None,
         })
     }
 }

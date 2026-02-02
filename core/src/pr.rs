@@ -90,6 +90,7 @@ impl PRManager {
             .output()?;
 
         let status_output = String::from_utf8_lossy(&status.stdout);
+
         if status_output.trim().is_empty() {
             return Ok(None); // No changes to commit
         }

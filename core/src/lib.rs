@@ -17,6 +17,7 @@ pub mod sandbox;
 pub mod secrets;
 pub mod spawn;
 pub mod team;
+pub mod team_orchestrator;
 pub mod watcher;
 
 pub use error::Error;
@@ -53,4 +54,8 @@ pub use beads::{
     BeadsClient, BeadsIssue, CreateOptions as BeadsCreateOptions, CreateResult as BeadsCreateResult,
     DependencyType as BeadsDependencyType, IssueStatus as BeadsIssueStatus,
     IssueType as BeadsIssueType, Priority as BeadsPriority,
+};
+pub use team_orchestrator::{
+    format_observability_markdown, CommandLineRecord, PermissionRecord, ReviewFeedbackRecord,
+    SecurityFinding, SpawnObservability, SpawnTeamOrchestrator,
 };

@@ -61,8 +61,10 @@ impl EphemeralRepo {
             return Err(Error::GitHub(format!("failed to create repo: {}", stderr)));
         }
 
-        // Get the cloned path
-        let path = PathBuf::from(&name);
+        // Get the cloned path (make it absolute to avoid issues with cwd changes)
+        let path = std::env::current_dir()
+            .map_err(|e| Error::Git(format!("failed to get current dir: {}", e)))?
+            .join(&name);
 
         // Initialize with a minimal commit
         let readme_content = format!(
