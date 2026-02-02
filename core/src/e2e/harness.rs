@@ -3,7 +3,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use crate::pr::PRManager;
+use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::WorktreeSandbox;
 use crate::spawn::{SpawnConfig, SpawnResult, Spawner};
@@ -634,9 +634,31 @@ impl E2EHarness {
 
         tracing::info!(branch = %branch_name, "pushed branch to remote");
 
-        // Generate PR body
-        let pr_body =
-            pr_manager.generate_pr_body(prompt, "E2E test completed successfully", &[], spawn_id);
+        // Get commits and file changes for enhanced PR body
+        let commits = match get_branch_commits(sandbox_path, branch_name, "main") {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to get branch commits, using empty list");
+                Vec::new()
+            }
+        };
+
+        let files_changed = match get_file_changes(sandbox_path, branch_name, "main") {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to get file changes, using empty list");
+                Vec::new()
+            }
+        };
+
+        // Generate enhanced PR body with accordion, commits, and file stats
+        let pr_body = pr_manager.generate_enhanced_pr_body(
+            prompt,
+            "E2E test completed successfully",
+            &commits,
+            &files_changed,
+            spawn_id,
+        );
 
         // Create PR
         match pr_manager.create_pr(

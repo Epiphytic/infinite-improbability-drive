@@ -7,6 +7,7 @@ pub mod config;
 pub mod planner;
 pub mod prompts;
 pub mod result;
+pub mod runner;
 pub mod task;
 
 pub use config::{
@@ -24,3 +25,4 @@ pub use planner::{
     Planner, ReviewPhase,
 };
 pub use prompts::{PlanPromptBuilder, PlanReviewPromptBuilder};
+pub use runner::{CruiseRunner, RunnerType as CruiseRunnerType};

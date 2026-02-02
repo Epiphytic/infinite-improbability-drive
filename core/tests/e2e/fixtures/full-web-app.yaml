@@ -1,6 +1,7 @@
 name: full-web-app
 description: Simple Rust CLI app with library
 runner: claude
+workflow: full
 
 prompt: |
   Create a simple Rust project with the following files:

@@ -2,7 +2,7 @@
 //!
 //! Handles creating PRs from worktree branches and resolving merge conflicts.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -371,6 +371,147 @@ impl PRManager {
 
         body
     }
+
+    /// Generates an enhanced PR body with accordion, commits, and file stats.
+    ///
+    /// This format is used for implementation PRs and includes:
+    /// - Summary section
+    /// - Accordion (`<details>`) for the original prompt
+    /// - Commit list table with hashes and messages
+    /// - Files changed with +/- counts
+    /// - Spawn ID and footer
+    pub fn generate_enhanced_pr_body(
+        &self,
+        prompt: &str,
+        summary: &str,
+        commits: &[(String, String)],          // (hash, message)
+        files_changed: &[(PathBuf, i32, i32)], // (path, additions, deletions)
+        spawn_id: &str,
+    ) -> String {
+        let mut body = String::new();
+
+        // Summary
+        body.push_str("## Summary\n\n");
+        body.push_str(summary);
+        body.push_str("\n\n");
+
+        // Original prompt in accordion
+        body.push_str("<details>\n");
+        body.push_str("<summary>Original Prompt</summary>\n\n");
+        body.push_str(prompt);
+        body.push_str("\n\n</details>\n\n");
+
+        // Commits table
+        if !commits.is_empty() {
+            body.push_str(&format!("## Commits ({})\n\n", commits.len()));
+            body.push_str("| Hash | Message |\n");
+            body.push_str("|------|--------|\n");
+            for (hash, message) in commits {
+                // Truncate hash to 7 characters for display
+                let short_hash = if hash.len() > 7 { &hash[..7] } else { hash };
+                body.push_str(&format!("| `{}` | {} |\n", short_hash, message));
+            }
+            body.push('\n');
+        }
+
+        // Files changed
+        if !files_changed.is_empty() {
+            body.push_str(&format!("## Files Changed ({})\n\n", files_changed.len()));
+            for (path, additions, deletions) in files_changed {
+                body.push_str(&format!(
+                    "- `{}` (+{}, -{})\n",
+                    path.display(),
+                    additions,
+                    deletions
+                ));
+            }
+            body.push('\n');
+        }
+
+        body.push_str("---\n");
+        body.push_str(&format!("**Spawn ID:** `{}`\n", spawn_id));
+        body.push_str("*Created by infinite-improbability-drive*\n");
+
+        body
+    }
+}
+
+/// Gets commits from a branch since diverging from base.
+///
+/// Returns a list of (hash, message) tuples for commits in `branch` that
+/// are not in `base`. Uses `git log base..branch --oneline`.
+pub fn get_branch_commits(
+    repo_path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<Vec<(String, String)>> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["log", &format!("{}..{}", base, branch), "--oneline"])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::Git(format!(
+            "failed to get branch commits: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let commits: Vec<(String, String)> = output_str
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            let hash = parts.first().unwrap_or(&"").to_string();
+            let message = parts.get(1).unwrap_or(&"").to_string();
+            (hash, message)
+        })
+        .collect();
+
+    Ok(commits)
+}
+
+/// Gets file changes with stats between base and branch.
+///
+/// Returns a list of (path, additions, deletions) tuples.
+/// Uses `git diff --numstat base..branch`.
+pub fn get_file_changes(
+    repo_path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<Vec<(PathBuf, i32, i32)>> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["diff", "--numstat", &format!("{}..{}", base, branch)])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::Git(format!(
+            "failed to get file changes: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let changes: Vec<(PathBuf, i32, i32)> = output_str
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 3 {
+                // Handle binary files that show "-" for additions/deletions
+                let additions = parts[0].parse::<i32>().unwrap_or(0);
+                let deletions = parts[1].parse::<i32>().unwrap_or(0);
+                let path = PathBuf::from(parts[2]);
+                Some((path, additions, deletions))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(changes)
 }
 
 #[cfg(test)]
@@ -381,9 +522,10 @@ mod tests {
     fn create_test_repo() -> TempDir {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
 
+        // Initialize with explicit main branch
         Command::new("git")
             .current_dir(temp_dir.path())
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .output()
             .expect("failed to init git");
 
@@ -552,5 +694,140 @@ conflicts
         assert_eq!(conflicts[1].path, PathBuf::from("file2.rs"));
         assert_eq!(conflicts[1].conflict_count, 2);
         assert!(conflicts[1].is_simple);
+    }
+
+    #[test]
+    fn enhanced_pr_body_generation() {
+        let manager = PRManager::new(PathBuf::from("/tmp"));
+
+        let commits = vec![
+            ("abc1234".to_string(), "Add Cargo.toml".to_string()),
+            ("def5678".to_string(), "Implement features".to_string()),
+        ];
+        let files = vec![
+            (PathBuf::from("Cargo.toml"), 15, 0),
+            (PathBuf::from("src/lib.rs"), 12, 0),
+        ];
+
+        let body = manager.generate_enhanced_pr_body(
+            "Create a simple Rust project",
+            "E2E test completed successfully",
+            &commits,
+            &files,
+            "spawn-123",
+        );
+
+        // Check summary section
+        assert!(body.contains("## Summary"));
+        assert!(body.contains("E2E test completed successfully"));
+
+        // Check accordion for prompt
+        assert!(body.contains("<details>"));
+        assert!(body.contains("<summary>Original Prompt</summary>"));
+        assert!(body.contains("Create a simple Rust project"));
+        assert!(body.contains("</details>"));
+
+        // Check commits table
+        assert!(body.contains("## Commits (2)"));
+        assert!(body.contains("| `abc1234` | Add Cargo.toml |"));
+        assert!(body.contains("| `def5678` | Implement features |"));
+
+        // Check files changed
+        assert!(body.contains("## Files Changed (2)"));
+        assert!(body.contains("`Cargo.toml` (+15, -0)"));
+        assert!(body.contains("`src/lib.rs` (+12, -0)"));
+
+        // Check footer
+        assert!(body.contains("**Spawn ID:** `spawn-123`"));
+        assert!(body.contains("infinite-improbability-drive"));
+    }
+
+    #[test]
+    fn enhanced_pr_body_handles_empty_commits_and_files() {
+        let manager = PRManager::new(PathBuf::from("/tmp"));
+
+        let body =
+            manager.generate_enhanced_pr_body("Some prompt", "Summary text", &[], &[], "spawn-456");
+
+        // Should still have summary and prompt
+        assert!(body.contains("## Summary"));
+        assert!(body.contains("<details>"));
+
+        // Should not have commits or files sections
+        assert!(!body.contains("## Commits"));
+        assert!(!body.contains("## Files Changed"));
+    }
+
+    #[test]
+    fn get_branch_commits_extracts_commits() {
+        let repo = create_test_repo();
+
+        // Create a branch and add commits
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["checkout", "-b", "feature"])
+            .output()
+            .unwrap();
+
+        std::fs::write(repo.path().join("file1.txt"), "content1").unwrap();
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["commit", "-m", "First commit"])
+            .output()
+            .unwrap();
+
+        std::fs::write(repo.path().join("file2.txt"), "content2").unwrap();
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["commit", "-m", "Second commit"])
+            .output()
+            .unwrap();
+
+        let commits = get_branch_commits(repo.path(), "feature", "main").unwrap();
+
+        assert_eq!(commits.len(), 2);
+        assert!(commits[0].1.contains("Second commit"));
+        assert!(commits[1].1.contains("First commit"));
+    }
+
+    #[test]
+    fn get_file_changes_extracts_stats() {
+        let repo = create_test_repo();
+
+        // Create a branch and add file changes
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["checkout", "-b", "feature"])
+            .output()
+            .unwrap();
+
+        std::fs::write(repo.path().join("new_file.txt"), "line1\nline2\nline3\n").unwrap();
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["commit", "-m", "Add new file"])
+            .output()
+            .unwrap();
+
+        let changes = get_file_changes(repo.path(), "feature", "main").unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, PathBuf::from("new_file.txt"));
+        assert_eq!(changes[0].1, 3); // 3 lines added
+        assert_eq!(changes[0].2, 0); // 0 lines deleted
     }
 }
