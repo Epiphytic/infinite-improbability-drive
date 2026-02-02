@@ -4,6 +4,8 @@
 
 pub mod approval;
 pub mod config;
+pub mod planner;
+pub mod prompts;
 pub mod result;
 pub mod task;
 
@@ -17,3 +19,8 @@ pub use result::{
 };
 pub use task::{CruisePlan, CruiseTask, TaskComplexity, TaskStatus};
 pub use approval::{ApprovalPoller, PrStatus};
+pub use planner::{
+    generate_plan_markdown, generate_pr_body, parse_plan_json, plan_to_beads, validate_plan,
+    Planner, ReviewPhase,
+};
+pub use prompts::{PlanPromptBuilder, PlanReviewPromptBuilder};
