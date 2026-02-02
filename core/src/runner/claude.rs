@@ -42,6 +42,8 @@ impl ClaudeRunner {
     fn build_args(&self, config: &LLMSpawnConfig) -> Vec<String> {
         let mut args = vec![
             "--print".to_string(), // Non-interactive mode
+            // Skip permissions since we're in a sandbox - the sandbox provides isolation
+            "--dangerously-skip-permissions".to_string(),
         ];
 
         // Add model if specified

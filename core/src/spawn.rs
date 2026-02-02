@@ -165,6 +165,9 @@ pub struct SpawnResult {
     pub pr_url: Option<String>,
     /// Paths to log files.
     pub logs: SpawnLogs,
+    /// Path to sandbox (if success, for validation before cleanup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_path: Option<PathBuf>,
 }
 
 /// Spawner that creates and manages sandboxed LLM instances.
@@ -287,6 +290,7 @@ impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
             summary,
             pr_url: None, // TODO: Extract from PR creation
             logs,
+            sandbox_path: watcher_result.sandbox_path,
         })
     }
 }

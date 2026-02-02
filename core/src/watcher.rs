@@ -60,6 +60,8 @@ pub struct WatcherResult {
     pub applied_fixes: Vec<PermissionFix>,
     /// Reason for termination, if any.
     pub termination_reason: Option<TerminationReason>,
+    /// Path to sandbox (not cleaned up on success for validation).
+    pub sandbox_path: Option<PathBuf>,
 }
 
 /// Reason the watcher terminated the spawn.
@@ -101,6 +103,12 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
     }
 
     /// Runs a spawn with full lifecycle management.
+    ///
+    /// On success, the sandbox is NOT cleaned up - the caller is responsible
+    /// for cleaning up after validation. The sandbox path is returned in
+    /// `WatcherResult::sandbox_path`.
+    ///
+    /// On failure (timeout, errors), the sandbox IS cleaned up automatically.
     pub async fn run(
         &self,
         prompt: String,
@@ -114,37 +122,45 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         loop {
             // Create sandbox
             let mut sandbox = self.provider.create(manifest.clone())?;
+            let sandbox_path = sandbox.path().clone();
 
             // Run LLM with monitoring
             let result = self
-                .run_with_monitoring(&prompt, sandbox.path().clone(), &manifest)
+                .run_with_monitoring(&prompt, sandbox_path.clone(), &manifest)
                 .await;
-
-            // Cleanup sandbox
-            sandbox.cleanup()?;
 
             match result {
                 Ok((progress, None)) => {
-                    // Success!
+                    // Success - DON'T cleanup, let caller validate first
+                    // Forget the sandbox so Drop doesn't cleanup
+                    std::mem::forget(sandbox);
+
                     return Ok(WatcherResult {
                         success: true,
                         progress,
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::Success),
+                        sandbox_path: Some(sandbox_path),
                     });
                 }
                 Ok((progress, Some(timeout_reason))) => {
-                    // Timeout
+                    // Timeout - cleanup sandbox
+                    sandbox.cleanup()?;
+
                     return Ok(WatcherResult {
                         success: false,
                         progress,
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::Timeout(timeout_reason)),
+                        sandbox_path: None,
                     });
                 }
                 Err(WatcherError::PermissionErrors(errors, progress)) => {
+                    // Cleanup this sandbox before potentially retrying
+                    sandbox.cleanup()?;
+
                     // Handle permission errors based on strategy
                     for error in &errors {
                         permission_errors.push(error.clone());
@@ -159,6 +175,7 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                                     termination_reason: Some(TerminationReason::PermissionError(
                                         reason.clone(),
                                     )),
+                                    sandbox_path: None,
                                 });
                             }
                             fix => {
@@ -174,6 +191,7 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                                         termination_reason: Some(
                                             TerminationReason::EscalationLimitReached,
                                         ),
+                                        sandbox_path: None,
                                     });
                                 }
 
@@ -187,12 +205,16 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                     // Continue loop with updated manifest
                 }
                 Err(WatcherError::LLMError(msg, progress)) => {
+                    // LLM error - cleanup sandbox
+                    sandbox.cleanup()?;
+
                     return Ok(WatcherResult {
                         success: false,
                         progress,
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::LLMError(msg)),
+                        sandbox_path: None,
                     });
                 }
             }

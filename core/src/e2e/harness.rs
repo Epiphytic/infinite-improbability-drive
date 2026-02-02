@@ -98,10 +98,27 @@ impl E2EHarness {
 
         let spawn_success = spawn_result.status == crate::SpawnStatus::Success;
 
+        // Determine validation path - use sandbox if available, otherwise repo root
+        let validation_path = spawn_result
+            .sandbox_path
+            .as_ref()
+            .unwrap_or_else(|| repo.path());
+
+        tracing::info!(
+            validation_path = ?validation_path,
+            sandbox_available = spawn_result.sandbox_path.is_some(),
+            "validating results"
+        );
+
         // Validate results
-        let validation = match Validator::validate(repo.path(), &fixture.validation) {
+        let validation = match Validator::validate(validation_path, &fixture.validation) {
             Ok(v) => Some(v),
             Err(e) => {
+                // Cleanup sandbox if it exists
+                if let Some(sandbox_path) = &spawn_result.sandbox_path {
+                    let _ = std::fs::remove_dir_all(sandbox_path);
+                }
+
                 return E2EResult {
                     fixture_name,
                     spawn_success,
@@ -114,6 +131,12 @@ impl E2EHarness {
         };
 
         let passed = spawn_success && validation.as_ref().map(|v| v.passed).unwrap_or(false);
+
+        // Cleanup sandbox after validation
+        if let Some(sandbox_path) = &spawn_result.sandbox_path {
+            tracing::info!(path = ?sandbox_path, "cleaning up sandbox after validation");
+            let _ = std::fs::remove_dir_all(sandbox_path);
+        }
 
         E2EResult {
             fixture_name,
