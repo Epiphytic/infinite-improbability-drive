@@ -1,8 +1,15 @@
 //! Main E2E test orchestrator.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::beads::{
+    commit_issue_change, BeadsClient, CreateOptions, IssueStatus, IssueType, Priority,
+};
+use crate::cruise::planner::parse_plan_json;
+use crate::cruise::task::TaskComplexity;
 use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::WorktreeSandbox;
@@ -11,6 +18,18 @@ use crate::spawn::{SpawnConfig, SpawnResult, Spawner};
 use super::fixture::{Fixture, RunnerType, WorkflowType};
 use super::repo::EphemeralRepo;
 use super::validator::{ValidationResult, Validator};
+
+/// A beads issue created from the plan.
+#[derive(Debug, Clone)]
+struct PlanIssue {
+    /// Beads issue ID (e.g., "bd-1").
+    beads_id: String,
+    /// Original task ID from plan (e.g., "CRUISE-001").
+    #[allow(dead_code)]
+    plan_task_id: String,
+    /// Task subject/title.
+    subject: String,
+}
 
 /// Configuration for E2E test harness.
 #[derive(Debug, Clone)]
@@ -305,15 +324,14 @@ impl E2EHarness {
             "running E2E fixture (full workflow)"
         );
 
+        // Phase 0: Initialize beads for issue tracking
+        if let Err(e) = self.init_beads(repo.path()) {
+            tracing::warn!(error = %e, "failed to initialize beads, continuing without issue tracking");
+        }
+
         // Phase 1: Planning
         let planning_prompt = fixture.planning_prompt.clone().unwrap_or_else(|| {
-            format!(
-                "Create a detailed implementation plan for the following task. \
-                 Output your plan as a structured markdown document with sections for: \
-                 Overview, Tasks (with dependencies), and Risk Areas.\n\n\
-                 Task: {}",
-                fixture.prompt
-            )
+            self.create_planning_prompt(&fixture.prompt)
         });
 
         let plan_result = self
@@ -347,6 +365,22 @@ impl E2EHarness {
                     repo_deleted: self.config.delete_on_failure,
                 };
             }
+        };
+
+        // Create beads issues from plan output
+        let plan_issues = if let Some(ref sandbox_path) = plan_sandbox_path {
+            match self.extract_and_create_beads_issues(sandbox_path, repo.path()) {
+                Ok(issues) => {
+                    tracing::info!(issue_count = issues.len(), "created beads issues from plan");
+                    issues
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create beads issues from plan");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
         };
 
         // Create plan PR
@@ -449,6 +483,11 @@ impl E2EHarness {
         };
 
         let passed = spawn_success && validation.as_ref().map(|v| v.passed).unwrap_or(false);
+
+        // Close beads issues with individual commits if successful
+        if passed && !plan_issues.is_empty() {
+            self.close_beads_issues(repo.path(), &plan_issues);
+        }
 
         // Create execution PR
         let mut pr_url = None;
@@ -675,6 +714,254 @@ impl E2EHarness {
                 tracing::warn!(error = %e, "failed to create PR");
                 None
             }
+        }
+    }
+
+    /// Initializes beads in the repository if not already initialized.
+    fn init_beads(&self, repo_path: &PathBuf) -> Result<(), String> {
+        let beads = BeadsClient::new(repo_path);
+
+        if beads.is_initialized() {
+            tracing::info!(path = ?repo_path, "beads already initialized");
+            return Ok(());
+        }
+
+        beads.init().map_err(|e| format!("beads init failed: {}", e))?;
+
+        // Stage and commit beads initialization
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["add", ".beads/"])
+            .output();
+
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["commit", "-m", "Initialize beads issue tracking"])
+            .output();
+
+        tracing::info!(path = ?repo_path, "initialized beads");
+        Ok(())
+    }
+
+    /// Creates a planning prompt that requests structured JSON output.
+    fn create_planning_prompt(&self, prompt: &str) -> String {
+        format!(
+            r#"Create a detailed implementation plan for the following task.
+
+Output your plan in two parts:
+
+1. First, create a markdown document with:
+   - Overview section explaining the approach
+   - Risk Areas section listing potential issues
+
+2. Then, output a JSON block with the tasks in this exact format:
+
+```json
+{{
+  "title": "Short plan title",
+  "overview": "Brief overview",
+  "tasks": [
+    {{
+      "id": "CRUISE-001",
+      "subject": "Task title",
+      "description": "What needs to be done",
+      "blocked_by": [],
+      "complexity": "low|medium|high",
+      "acceptance_criteria": ["Criterion 1", "Criterion 2"]
+    }}
+  ],
+  "risks": ["Risk 1", "Risk 2"]
+}}
+```
+
+Use CRUISE-XXX IDs. List dependencies in blocked_by using task IDs.
+
+Task: {}"#,
+            prompt
+        )
+    }
+
+    /// Extracts plan from spawn output and creates beads issues.
+    fn extract_and_create_beads_issues(
+        &self,
+        sandbox_path: &PathBuf,
+        repo_path: &PathBuf,
+    ) -> Result<Vec<PlanIssue>, String> {
+        // Look for plan files in the sandbox
+        let plan_content = self
+            .find_and_read_plan(sandbox_path)
+            .map_err(|e| format!("failed to find plan: {}", e))?;
+
+        // Try to parse as CruisePlan
+        let plan = match parse_plan_json(&plan_content) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not parse plan JSON, skipping beads issue creation");
+                return Err(format!("could not parse plan: {}", e));
+            }
+        };
+
+        // Create beads issues
+        let beads = BeadsClient::new(repo_path);
+        let mut created_issues = Vec::new();
+        let mut id_mapping: HashMap<String, String> = HashMap::new();
+
+        for task in &plan.tasks {
+            let options = CreateOptions {
+                description: Some(task.description.clone()),
+                design: None,
+                acceptance_criteria: if task.acceptance_criteria.is_empty() {
+                    None
+                } else {
+                    Some(task.acceptance_criteria.join("\n- "))
+                },
+                priority: match task.complexity {
+                    TaskComplexity::Low => Priority::Low,
+                    TaskComplexity::Medium => Priority::Medium,
+                    TaskComplexity::High => Priority::High,
+                },
+                issue_type: IssueType::Task,
+                labels: vec!["cruise-control".to_string(), "e2e-test".to_string()],
+                dependencies: vec![],
+            };
+
+            match beads.create(&task.subject, options) {
+                Ok(result) => {
+                    tracing::info!(
+                        beads_id = %result.id,
+                        plan_id = %task.id,
+                        subject = %task.subject,
+                        "created beads issue"
+                    );
+
+                    id_mapping.insert(task.id.clone(), result.id.clone());
+
+                    created_issues.push(PlanIssue {
+                        beads_id: result.id,
+                        plan_task_id: task.id.clone(),
+                        subject: task.subject.clone(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        task_id = %task.id,
+                        "failed to create beads issue"
+                    );
+                }
+            }
+        }
+
+        // Add dependencies after all issues are created
+        for task in &plan.tasks {
+            if let Some(beads_id) = id_mapping.get(&task.id) {
+                for dep_id in &task.blocked_by {
+                    if let Some(dep_beads_id) = id_mapping.get(dep_id) {
+                        if let Err(e) = beads.add_dependency(
+                            beads_id,
+                            dep_beads_id,
+                            crate::beads::DependencyType::Blocks,
+                        ) {
+                            tracing::warn!(
+                                error = %e,
+                                from = %beads_id,
+                                to = %dep_beads_id,
+                                "failed to add dependency"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Commit the beads issue creation
+        if !created_issues.is_empty() {
+            let _ = commit_issue_change(
+                repo_path,
+                "plan",
+                &format!("Create {} beads issues from plan", created_issues.len()),
+            );
+        }
+
+        Ok(created_issues)
+    }
+
+    /// Finds and reads plan content from the sandbox.
+    fn find_and_read_plan(&self, sandbox_path: &PathBuf) -> Result<String, String> {
+        // Look for common plan file locations
+        let plan_paths = [
+            sandbox_path.join("docs/plans"),
+            sandbox_path.join("docs"),
+            sandbox_path.join("plan"),
+            sandbox_path.clone(),
+        ];
+
+        for dir in &plan_paths {
+            if dir.exists() && dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map(|e| e == "md").unwrap_or(false) {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if content.contains("CRUISE-") || content.contains("```json") {
+                                    return Ok(content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Err("No plan file found in sandbox".to_string())
+    }
+
+    /// Closes beads issues with individual commits for each.
+    fn close_beads_issues(&self, repo_path: &PathBuf, issues: &[PlanIssue]) {
+        let beads = BeadsClient::new(repo_path);
+
+        for issue in issues {
+            // Update to in_progress first
+            if let Err(e) = beads.update_status(&issue.beads_id, IssueStatus::InProgress) {
+                tracing::warn!(
+                    error = %e,
+                    issue = %issue.beads_id,
+                    "failed to update issue to in_progress"
+                );
+            }
+
+            // Close the issue
+            match beads.close(
+                &issue.beads_id,
+                Some("Completed as part of E2E test execution"),
+            ) {
+                Ok(()) => {
+                    // Create a commit for this issue closure
+                    let _ = commit_issue_change(
+                        repo_path,
+                        &issue.beads_id,
+                        &format!("Close {}: {}", issue.beads_id, issue.subject),
+                    );
+
+                    tracing::info!(
+                        beads_id = %issue.beads_id,
+                        subject = %issue.subject,
+                        "closed beads issue"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        issue = %issue.beads_id,
+                        "failed to close issue"
+                    );
+                }
+            }
+        }
+
+        // Sync beads at the end (may fail if no remote, which is OK)
+        if let Err(e) = beads.sync() {
+            tracing::debug!(error = %e, "beads sync warning (expected for ephemeral repos)");
         }
     }
 }

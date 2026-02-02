@@ -3,6 +3,7 @@
 //! This library provides the core functionality for launching isolated LLM instances
 //! in git worktree sandboxes with intelligent resource provisioning and lifecycle management.
 
+pub mod beads;
 pub mod config;
 pub mod cruise;
 pub mod e2e;
@@ -40,11 +41,16 @@ pub use config::{
     KNOWN_LLMS, KNOWN_TOOLS,
 };
 pub use cruise::{
-    generate_plan_markdown, generate_pr_body, parse_plan_json, plan_to_beads,
+    generate_plan_markdown, generate_pr_body, parse_plan_json,
     validate_plan as validate_cruise_plan, AdherenceCheck, AdherenceStatus, ApprovalConfig,
     AuditFinding, BuildResult, BuildingConfig, CruiseConfig, CruisePlan, CruiseResult, CruiseTask,
     FindingSeverity, FunctionalTestResult, PlanPromptBuilder, PlanResult, Planner, PlanningConfig,
     PlanReviewPromptBuilder, PrStrategy, RepoLifecycle, ReviewPhase, TaskComplexity, TaskResult,
     TaskStatus, TestConfig, TestLevel, ValidationConfig as CruiseValidationConfig,
     ValidationResult as CruiseValidationResult,
+};
+pub use beads::{
+    BeadsClient, BeadsIssue, CreateOptions as BeadsCreateOptions, CreateResult as BeadsCreateResult,
+    DependencyType as BeadsDependencyType, IssueStatus as BeadsIssueStatus,
+    IssueType as BeadsIssueType, Priority as BeadsPriority,
 };

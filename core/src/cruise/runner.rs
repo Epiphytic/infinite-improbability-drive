@@ -2,12 +2,13 @@
 //!
 //! Provides two workflow modes:
 //! - Simple: Single spawn for straightforward tasks
-//! - Full: Plan → Approve → Execute with PR integration
+//! - Full: Plan → Approve → Execute with PR integration and beads issue tracking
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::beads::{BeadsClient, CreateOptions, IssueStatus, IssueType, Priority, commit_issue_change};
 use crate::error::{Error, Result};
 use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
@@ -16,8 +17,8 @@ use crate::spawn::{SpawnConfig, SpawnResult, SpawnStatus, Spawner};
 
 use super::config::CruiseConfig;
 use super::planner::generate_pr_body as generate_plan_pr_body;
-use super::result::{BuildResult, CruiseResult, PlanResult};
-use super::task::CruisePlan;
+use super::result::{BuildResult, CruiseResult, PlanResult, TaskResult};
+use super::task::{CruisePlan, CruiseTask, TaskStatus};
 
 /// Runner type for LLM selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,11 +38,22 @@ impl RunnerType {
     }
 }
 
+/// A beads issue created from the plan.
+#[derive(Debug, Clone)]
+pub struct PlanIssue {
+    /// Beads issue ID (e.g., "bd-1").
+    pub beads_id: String,
+    /// Original task ID from plan (e.g., "CRUISE-001").
+    pub plan_task_id: String,
+    /// Task subject/title.
+    pub subject: String,
+}
+
 /// High-level orchestrator for cruise-control workflows.
 ///
 /// Manages the full lifecycle of a cruise-control run:
 /// - Simple workflow: Single spawn for straightforward tasks
-/// - Full workflow: Plan → Approve → Execute with PR integration
+/// - Full workflow: Plan → Approve → Execute with PR integration and beads tracking
 pub struct CruiseRunner<P: SandboxProvider + Clone> {
     config: CruiseConfig,
     provider: P,
@@ -116,14 +128,17 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         })
     }
 
-    /// Runs a full workflow: Plan → Approve → Execute.
+    /// Runs a full workflow: Plan → Approve → Execute with beads integration.
     ///
     /// This workflow:
-    /// 1. Runs a planning spawn to generate an implementation plan
-    /// 2. Creates a PR for the plan with enhanced formatting
-    /// 3. Waits for approval (or auto-approves in test mode)
-    /// 4. Runs an execution spawn to implement the plan
-    /// 5. Creates a PR for the implementation with commits and file stats
+    /// 1. Initializes beads in the repository
+    /// 2. Runs a planning spawn to generate an implementation plan
+    /// 3. Creates beads issues from the plan
+    /// 4. Creates a PR for the plan with enhanced formatting
+    /// 5. Waits for approval (or auto-approves in test mode)
+    /// 6. Runs an execution spawn to implement the plan
+    /// 7. Closes beads issues with individual commits
+    /// 8. Creates a PR for the implementation with commits and file stats
     pub async fn run_full(
         &self,
         prompt: &str,
@@ -133,10 +148,13 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
     ) -> Result<CruiseResult> {
         let start = Instant::now();
 
+        // Phase 0: Initialize beads
+        self.init_beads(repo_path)?;
+
         // Phase 1: Planning
         let planning_prompt = self.create_planning_prompt(prompt);
-        let plan_result = self
-            .run_planning_phase(&planning_prompt, runner_type, timeout, repo_path)
+        let (plan_result, plan_issues) = self
+            .run_planning_phase(&planning_prompt, runner_type, timeout, repo_path, prompt)
             .await?;
 
         if !plan_result.success {
@@ -151,20 +169,24 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             });
         }
 
+        tracing::info!(
+            issues_created = plan_issues.len(),
+            "created beads issues from plan"
+        );
+
         // Phase 2: Wait for approval (or auto-approve)
         if let Some(ref pr_url) = plan_result.pr_url {
             if self.auto_approve {
                 self.auto_approve_pr(pr_url)?;
             } else {
                 // In production, would poll for approval
-                // For now, just log and continue
                 tracing::info!(pr_url = %pr_url, "plan PR created, waiting for approval");
             }
         }
 
         // Phase 3: Execution
         let build_result = self
-            .run_execution_phase(prompt, runner_type, timeout, repo_path)
+            .run_execution_phase(prompt, runner_type, timeout, repo_path, &plan_issues)
             .await?;
 
         let success = build_result.success;
@@ -184,25 +206,79 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         })
     }
 
-    /// Creates a planning prompt from the user's original prompt.
+    /// Initializes beads in the repository if not already initialized.
+    fn init_beads(&self, repo_path: &PathBuf) -> Result<()> {
+        let beads = BeadsClient::new(repo_path);
+
+        if beads.is_initialized() {
+            tracing::info!(path = ?repo_path, "beads already initialized");
+            return Ok(());
+        }
+
+        beads.init()?;
+
+        // Stage and commit beads initialization
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["add", ".beads/"])
+            .output();
+
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["commit", "-m", "Initialize beads issue tracking"])
+            .output();
+
+        tracing::info!(path = ?repo_path, "initialized beads");
+        Ok(())
+    }
+
+    /// Creates a planning prompt that requests structured JSON output.
     fn create_planning_prompt(&self, prompt: &str) -> String {
         format!(
-            "Create a detailed implementation plan for the following task. \
-             Output your plan as a structured markdown document with sections for: \
-             Overview, Tasks (with dependencies), and Risk Areas.\n\n\
-             Task: {}",
+            r#"Create a detailed implementation plan for the following task.
+
+Output your plan in two parts:
+
+1. First, create a markdown document with:
+   - Overview section explaining the approach
+   - Risk Areas section listing potential issues
+
+2. Then, output a JSON block with the tasks in this exact format:
+
+```json
+{{
+  "title": "Short plan title",
+  "overview": "Brief overview",
+  "tasks": [
+    {{
+      "id": "CRUISE-001",
+      "subject": "Task title",
+      "description": "What needs to be done",
+      "blocked_by": [],
+      "complexity": "low|medium|high",
+      "acceptance_criteria": ["Criterion 1", "Criterion 2"]
+    }}
+  ],
+  "risks": ["Risk 1", "Risk 2"]
+}}
+```
+
+Use CRUISE-XXX IDs. List dependencies in blocked_by using task IDs.
+
+Task: {}"#,
             prompt
         )
     }
 
-    /// Runs the planning phase and creates a plan PR.
+    /// Runs the planning phase, creates beads issues, and creates a plan PR.
     async fn run_planning_phase(
         &self,
         planning_prompt: &str,
         runner_type: RunnerType,
         timeout: Duration,
         repo_path: &PathBuf,
-    ) -> Result<PlanResult> {
+        original_prompt: &str,
+    ) -> Result<(PlanResult, Vec<PlanIssue>)> {
         let start = Instant::now();
 
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("planning"));
@@ -213,10 +289,29 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         let spawn_result = spawner.spawn(config, manifest, runner).await?;
         let success = spawn_result.status == SpawnStatus::Success;
 
+        let mut plan_issues = Vec::new();
+        let mut task_count = 0;
+
+        // Create beads issues from plan if successful
+        if success {
+            if let Some(ref sandbox_path) = spawn_result.sandbox_path {
+                // Try to parse plan and create issues
+                match self.extract_and_create_beads_issues(sandbox_path, repo_path) {
+                    Ok(issues) => {
+                        task_count = issues.len();
+                        plan_issues = issues;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to create beads issues from plan");
+                    }
+                }
+            }
+        }
+
         // Create plan PR if successful
         let pr_url = if success {
             if let Some(ref sandbox_path) = spawn_result.sandbox_path {
-                self.create_plan_pr(sandbox_path, repo_path, planning_prompt, &spawn_result)
+                self.create_plan_pr(sandbox_path, repo_path, original_prompt, &spawn_result, task_count)
             } else {
                 None
             }
@@ -224,10 +319,10 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             None
         };
 
-        Ok(PlanResult {
+        let plan_result = PlanResult {
             success,
-            iterations: 1, // Single-shot for now
-            task_count: 0, // Would extract from plan
+            iterations: 1,
+            task_count,
             pr_url,
             duration: start.elapsed(),
             plan_file: None,
@@ -236,7 +331,147 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             } else {
                 Some(spawn_result.summary)
             },
-        })
+        };
+
+        Ok((plan_result, plan_issues))
+    }
+
+    /// Extracts plan from spawn output and creates beads issues.
+    fn extract_and_create_beads_issues(
+        &self,
+        sandbox_path: &PathBuf,
+        repo_path: &PathBuf,
+    ) -> Result<Vec<PlanIssue>> {
+        // Look for plan files in the sandbox
+        let plan_content = self.find_and_read_plan(sandbox_path)?;
+
+        // Try to parse as CruisePlan
+        let plan = match super::planner::parse_plan_json(&plan_content) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not parse plan JSON, creating single task");
+                // Create a single task for the whole prompt
+                let mut plan = CruisePlan::new("");
+                plan.title = "Implementation".to_string();
+                plan.tasks.push(CruiseTask::new("CRUISE-001", "Implement feature"));
+                plan
+            }
+        };
+
+        // Create beads issues
+        let beads = BeadsClient::new(repo_path);
+        let mut created_issues = Vec::new();
+        let mut id_mapping: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        for task in &plan.tasks {
+            let options = CreateOptions {
+                description: Some(task.description.clone()),
+                design: None,
+                acceptance_criteria: if task.acceptance_criteria.is_empty() {
+                    None
+                } else {
+                    Some(task.acceptance_criteria.join("\n- "))
+                },
+                priority: match task.complexity {
+                    super::task::TaskComplexity::Low => Priority::Low,
+                    super::task::TaskComplexity::Medium => Priority::Medium,
+                    super::task::TaskComplexity::High => Priority::High,
+                },
+                issue_type: IssueType::Task,
+                labels: vec!["cruise-control".to_string()],
+                dependencies: vec![],
+            };
+
+            match beads.create(&task.subject, options) {
+                Ok(result) => {
+                    tracing::info!(
+                        beads_id = %result.id,
+                        plan_id = %task.id,
+                        subject = %task.subject,
+                        "created beads issue"
+                    );
+
+                    id_mapping.insert(task.id.clone(), result.id.clone());
+
+                    created_issues.push(PlanIssue {
+                        beads_id: result.id,
+                        plan_task_id: task.id.clone(),
+                        subject: task.subject.clone(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        task_id = %task.id,
+                        "failed to create beads issue"
+                    );
+                }
+            }
+        }
+
+        // Add dependencies after all issues are created
+        for task in &plan.tasks {
+            if let Some(beads_id) = id_mapping.get(&task.id) {
+                for dep_id in &task.blocked_by {
+                    if let Some(dep_beads_id) = id_mapping.get(dep_id) {
+                        if let Err(e) = beads.add_dependency(
+                            beads_id,
+                            dep_beads_id,
+                            crate::beads::DependencyType::Blocks,
+                        ) {
+                            tracing::warn!(
+                                error = %e,
+                                from = %beads_id,
+                                to = %dep_beads_id,
+                                "failed to add dependency"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Commit the beads issue creation
+        if !created_issues.is_empty() {
+            let _ = commit_issue_change(
+                repo_path,
+                "plan",
+                &format!("Create {} beads issues from plan", created_issues.len()),
+            );
+        }
+
+        Ok(created_issues)
+    }
+
+    /// Finds and reads plan content from the sandbox.
+    fn find_and_read_plan(&self, sandbox_path: &PathBuf) -> Result<String> {
+        // Look for common plan file locations
+        let plan_paths = [
+            sandbox_path.join("docs/plans"),
+            sandbox_path.join("docs"),
+            sandbox_path.join("plan"),
+            sandbox_path.clone(),
+        ];
+
+        for dir in &plan_paths {
+            if dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map(|e| e == "md").unwrap_or(false) {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if content.contains("CRUISE-") || content.contains("```json") {
+                                    return Ok(content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no plan file found, return empty which will trigger fallback
+        Err(Error::Cruise("No plan file found in sandbox".to_string()))
     }
 
     /// Creates a PR for the plan with enhanced formatting.
@@ -246,16 +481,23 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         repo_path: &PathBuf,
         prompt: &str,
         spawn_result: &SpawnResult,
+        task_count: usize,
     ) -> Option<String> {
         let pr_manager = PRManager::new(repo_path.clone());
 
         // Commit changes
-        let commit_message = format!("Plan: {}\n\nSpawn ID: {}",
+        let commit_message = format!(
+            "Plan: {}\n\nCreated {} tasks\nSpawn ID: {}",
             truncate_string(prompt, 50),
+            task_count,
             spawn_result.spawn_id
         );
 
-        if pr_manager.commit_changes(sandbox_path, &commit_message).ok()?.is_none() {
+        if pr_manager
+            .commit_changes(sandbox_path, &commit_message)
+            .ok()?
+            .is_none()
+        {
             tracing::info!("no plan changes to commit");
             return None;
         }
@@ -271,8 +513,9 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             return None;
         }
 
-        // Create a simple plan for the PR body
-        let plan = CruisePlan::new(prompt);
+        // Create a plan for the PR body
+        let mut plan = CruisePlan::new(prompt);
+        plan.title = format!("Implementation Plan ({} tasks)", task_count);
         let pr_body = generate_plan_pr_body(&plan, prompt, 1);
 
         // Create PR
@@ -287,13 +530,14 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             .map(|pr| pr.url)
     }
 
-    /// Runs the execution phase and creates an implementation PR.
+    /// Runs the execution phase, closes beads issues, and creates an implementation PR.
     async fn run_execution_phase(
         &self,
         prompt: &str,
         runner_type: RunnerType,
         timeout: Duration,
         repo_path: &PathBuf,
+        plan_issues: &[PlanIssue],
     ) -> Result<BuildResult> {
         let start = Instant::now();
 
@@ -305,6 +549,18 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         let spawn_result = spawner.spawn(config, manifest, runner).await?;
         let success = spawn_result.status == SpawnStatus::Success;
 
+        // Close beads issues and create individual commits
+        let task_results = if success {
+            self.close_beads_issues(repo_path, plan_issues)
+        } else {
+            vec![]
+        };
+
+        let completed_count = task_results
+            .iter()
+            .filter(|r| r.status == TaskStatus::Completed)
+            .count();
+
         // Create implementation PR if successful
         if success {
             if let Some(ref sandbox_path) = spawn_result.sandbox_path {
@@ -314,12 +570,79 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
 
         Ok(BuildResult {
             success,
-            task_results: vec![],
+            task_results,
             max_parallelism: 1,
             duration: start.elapsed(),
-            completed_count: if success { 1 } else { 0 },
+            completed_count,
             blocked_count: 0,
         })
+    }
+
+    /// Closes beads issues with individual commits for each.
+    fn close_beads_issues(&self, repo_path: &PathBuf, issues: &[PlanIssue]) -> Vec<TaskResult> {
+        let beads = BeadsClient::new(repo_path);
+        let mut results = Vec::new();
+
+        for issue in issues {
+            let start = Instant::now();
+
+            // Update to in_progress first
+            if let Err(e) = beads.update_status(&issue.beads_id, IssueStatus::InProgress) {
+                tracing::warn!(
+                    error = %e,
+                    issue = %issue.beads_id,
+                    "failed to update issue to in_progress"
+                );
+            }
+
+            // Close the issue
+            let close_result = beads.close(
+                &issue.beads_id,
+                Some(&format!("Completed as part of cruise-control execution")),
+            );
+
+            let (status, error) = match close_result {
+                Ok(()) => {
+                    // Create a commit for this issue closure
+                    let _ = commit_issue_change(
+                        repo_path,
+                        &issue.beads_id,
+                        &format!("Close {}: {}", issue.beads_id, issue.subject),
+                    );
+
+                    tracing::info!(
+                        beads_id = %issue.beads_id,
+                        subject = %issue.subject,
+                        "closed beads issue"
+                    );
+
+                    (TaskStatus::Completed, None)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        issue = %issue.beads_id,
+                        "failed to close issue"
+                    );
+                    (TaskStatus::Blocked, Some(e.to_string()))
+                }
+            };
+
+            results.push(TaskResult {
+                task_id: issue.plan_task_id.clone(),
+                status,
+                pr_url: None,
+                duration: start.elapsed(),
+                error,
+            });
+        }
+
+        // Sync beads at the end
+        if let Err(e) = beads.sync() {
+            tracing::warn!(error = %e, "failed to sync beads");
+        }
+
+        results
     }
 
     /// Creates an implementation PR with enhanced formatting (commits, file stats).
@@ -339,7 +662,11 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             spawn_result.spawn_id
         );
 
-        if pr_manager.commit_changes(sandbox_path, &commit_message).ok()?.is_none() {
+        if pr_manager
+            .commit_changes(sandbox_path, &commit_message)
+            .ok()?
+            .is_none()
+        {
             tracing::info!("no implementation changes to commit");
             return None;
         }
@@ -357,7 +684,8 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
 
         // Get commits and file changes for enhanced PR body
         let commits = get_branch_commits(sandbox_path, branch_name, "main").unwrap_or_default();
-        let files_changed = get_file_changes(sandbox_path, branch_name, "main").unwrap_or_default();
+        let files_changed =
+            get_file_changes(sandbox_path, branch_name, "main").unwrap_or_default();
 
         // Generate enhanced PR body
         let pr_body = pr_manager.generate_enhanced_pr_body(
@@ -491,8 +819,8 @@ mod tests {
     #[test]
     fn cruise_runner_with_auto_approve() {
         let provider = WorktreeSandbox::new(PathBuf::from("/tmp"), None);
-        let runner = CruiseRunner::new(provider, PathBuf::from("/tmp/logs"))
-            .with_auto_approve(true);
+        let runner =
+            CruiseRunner::new(provider, PathBuf::from("/tmp/logs")).with_auto_approve(true);
         assert!(runner.auto_approve);
     }
 
@@ -500,18 +828,31 @@ mod tests {
     fn cruise_runner_with_config() {
         let provider = WorktreeSandbox::new(PathBuf::from("/tmp"), None);
         let config = CruiseConfig::default();
-        let runner = CruiseRunner::new(provider, PathBuf::from("/tmp/logs"))
-            .with_config(config.clone());
+        let runner =
+            CruiseRunner::new(provider, PathBuf::from("/tmp/logs")).with_config(config.clone());
         assert_eq!(runner.config().planning.ping_pong_iterations, 5);
     }
 
     #[test]
-    fn create_planning_prompt() {
+    fn create_planning_prompt_includes_json_format() {
         let provider = WorktreeSandbox::new(PathBuf::from("/tmp"), None);
         let runner = CruiseRunner::new(provider, PathBuf::from("/tmp/logs"));
 
         let prompt = runner.create_planning_prompt("Build a REST API");
         assert!(prompt.contains("Build a REST API"));
-        assert!(prompt.contains("implementation plan"));
+        assert!(prompt.contains("```json"));
+        assert!(prompt.contains("CRUISE-"));
+        assert!(prompt.contains("blocked_by"));
+    }
+
+    #[test]
+    fn plan_issue_struct() {
+        let issue = PlanIssue {
+            beads_id: "bd-1".to_string(),
+            plan_task_id: "CRUISE-001".to_string(),
+            subject: "Setup project".to_string(),
+        };
+        assert_eq!(issue.beads_id, "bd-1");
+        assert_eq!(issue.plan_task_id, "CRUISE-001");
     }
 }
