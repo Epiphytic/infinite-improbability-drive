@@ -62,6 +62,28 @@ impl EphemeralRepo {
             .output()
             .map_err(|e| Error::Git(format!("failed to commit: {}", e)))?;
 
+        // Ensure we're on a branch called 'main' (git init might use different defaults)
+        Command::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(&path)
+            .output()
+            .map_err(|e| Error::Git(format!("failed to rename branch to main: {}", e)))?;
+
+        // Push initial commit to remote to establish 'main' as the default branch
+        let push_output = Command::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(&path)
+            .output()
+            .map_err(|e| Error::Git(format!("failed to push: {}", e)))?;
+
+        if !push_output.status.success() {
+            let stderr = String::from_utf8_lossy(&push_output.stderr);
+            return Err(Error::Git(format!(
+                "failed to push initial commit: {}",
+                stderr
+            )));
+        }
+
         Ok(Self {
             org: org.to_string(),
             name,

@@ -32,6 +32,9 @@ async fn smoke_hello() {
     println!("Fixture: {}", result.fixture_name);
     println!("Spawn success: {}", result.spawn_success);
     println!("Passed: {}", result.passed);
+    if let Some(pr_url) = &result.pr_url {
+        println!("PR URL: {}", pr_url);
+    }
     if let Some(validation) = &result.validation {
         println!("Validation messages:");
         for msg in &validation.messages {
@@ -61,6 +64,9 @@ async fn code_generation() {
     if let Some(spawn_result) = &result.spawn_result {
         println!("Duration: {:?}", spawn_result.duration);
         println!("Summary: {}", spawn_result.summary);
+    }
+    if let Some(pr_url) = &result.pr_url {
+        println!("PR URL: {}", pr_url);
     }
     if let Some(validation) = &result.validation {
         println!("Validation:");
@@ -93,6 +99,9 @@ async fn full_web_app() {
         println!("Summary: {}", spawn_result.summary);
         println!("Commits: {}", spawn_result.commits.len());
     }
+    if let Some(pr_url) = &result.pr_url {
+        println!("PR URL: {}", pr_url);
+    }
     if let Some(validation) = &result.validation {
         println!("Validation:");
         for msg in &validation.messages {
@@ -122,6 +131,9 @@ async fn smoke_hello_gemini() {
 
     println!("\n=== E2E Result (Gemini) ===");
     println!("Passed: {}", result.passed);
+    if let Some(pr_url) = &result.pr_url {
+        println!("PR URL: {}", pr_url);
+    }
 
     assert!(result.passed, "E2E test failed: {:?}", result.error);
 }
