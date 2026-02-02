@@ -3,7 +3,7 @@
 //! Uses spawn-team ping-pong with phased reviews to generate
 //! dependency-aware plans as beads issues.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -396,6 +396,142 @@ fn compute_execution_waves(plan: &CruisePlan) -> Vec<Vec<String>> {
     waves
 }
 
+/// Generates the PR body for a plan PR.
+pub fn generate_pr_body(plan: &CruisePlan, user_prompt: &str, iterations: u32) -> String {
+    let mut body = String::new();
+
+    // Summary
+    body.push_str("## Summary\n\n");
+    body.push_str(&plan.overview);
+    body.push_str("\n\n");
+
+    // Original prompt in accordion
+    body.push_str("<details>\n");
+    body.push_str("<summary>Original Prompt</summary>\n\n");
+    body.push_str(user_prompt);
+    body.push_str("\n\n</details>\n\n");
+
+    // Tasks table
+    body.push_str(&format!("## Tasks ({})\n\n", plan.tasks.len()));
+    body.push_str("| ID | Subject | Component | Complexity | Dependencies |\n");
+    body.push_str("|----|---------|-----------|------------|---------------|\n");
+    for task in &plan.tasks {
+        let component = task.component.as_deref().unwrap_or("-");
+        let complexity = format!("{:?}", task.complexity).to_lowercase();
+        let deps = if task.blocked_by.is_empty() {
+            "-".to_string()
+        } else {
+            task.blocked_by.join(", ")
+        };
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            task.id, task.subject, component, complexity, deps
+        ));
+    }
+    body.push('\n');
+
+    // ASCII dependency graph
+    body.push_str("## Dependency Graph\n\n");
+    body.push_str("```\n");
+    body.push_str(&generate_ascii_tree(plan));
+    body.push_str("```\n\n");
+
+    // Parallel execution
+    body.push_str("## Parallel Execution\n\n");
+    let waves = compute_execution_waves(plan);
+    for (i, wave) in waves.iter().enumerate() {
+        if wave.len() > 1 {
+            body.push_str(&format!(
+                "- **Wave {}**: {} *(parallel)*\n",
+                i + 1,
+                wave.join(", ")
+            ));
+        } else {
+            body.push_str(&format!("- **Wave {}**: {}\n", i + 1, wave.join(", ")));
+        }
+    }
+    body.push('\n');
+
+    // Planning stats
+    body.push_str("## Planning Stats\n\n");
+    body.push_str(&format!("- **Iterations**: {}\n", iterations));
+    body.push_str(
+        "- **Review phases**: Security ✓, Feasibility ✓, Granularity ✓, Dependencies ✓\n",
+    );
+
+    body
+}
+
+/// Generates an ASCII tree representation of task dependencies.
+fn generate_ascii_tree(plan: &CruisePlan) -> String {
+    let mut tree = String::new();
+
+    // Find root tasks (no dependencies)
+    let roots: Vec<&CruiseTask> = plan
+        .tasks
+        .iter()
+        .filter(|t| t.blocked_by.is_empty())
+        .collect();
+
+    // Build dependency map (task -> tasks that depend on it)
+    let mut dependents: HashMap<&str, Vec<&CruiseTask>> = HashMap::new();
+    for task in &plan.tasks {
+        for dep in &task.blocked_by {
+            dependents.entry(dep.as_str()).or_default().push(task);
+        }
+    }
+
+    // Render tree from each root
+    for root in roots {
+        render_tree_node(&mut tree, root, &dependents, "", true);
+    }
+
+    tree
+}
+
+fn render_tree_node(
+    output: &mut String,
+    task: &CruiseTask,
+    dependents: &HashMap<&str, Vec<&CruiseTask>>,
+    prefix: &str,
+    is_last: bool,
+) {
+    let connector = if prefix.is_empty() {
+        ""
+    } else if is_last {
+        "└── "
+    } else {
+        "├── "
+    };
+
+    output.push_str(&format!(
+        "{}{}{} ({})\n",
+        prefix, connector, task.id, task.subject
+    ));
+
+    let children = dependents
+        .get(task.id.as_str())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let child_prefix = if prefix.is_empty() {
+        String::new()
+    } else if is_last {
+        format!("{}    ", prefix)
+    } else {
+        format!("{}│   ", prefix)
+    };
+
+    for (i, child) in children.iter().enumerate() {
+        render_tree_node(
+            output,
+            child,
+            dependents,
+            &child_prefix,
+            i == children.len() - 1,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,5 +835,48 @@ Here's my plan:
         assert!(waves[1].contains(&"CRUISE-002".to_string()));
         assert!(waves[1].contains(&"CRUISE-003".to_string()));
         assert_eq!(waves[2], vec!["CRUISE-004"]);
+    }
+
+    #[test]
+    fn generate_pr_body_includes_all_sections() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Test Plan".to_string();
+        plan.overview = "Build something cool.".to_string();
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "Setup").with_component("infra"),
+            CruiseTask::new("CRUISE-002", "Build").with_blocked_by(vec!["CRUISE-001".to_string()]),
+        ];
+
+        let body = generate_pr_body(&plan, "Original request here", 5);
+
+        assert!(body.contains("## Summary"));
+        assert!(body.contains("Build something cool."));
+        assert!(body.contains("<details>"));
+        assert!(body.contains("Original request here"));
+        assert!(body.contains("## Tasks (2)"));
+        assert!(body.contains("| CRUISE-001 |"));
+        assert!(body.contains("## Dependency Graph"));
+        assert!(body.contains("## Parallel Execution"));
+        assert!(body.contains("**Wave 1**"));
+        assert!(body.contains("## Planning Stats"));
+        assert!(body.contains("Iterations**: 5"));
+    }
+
+    #[test]
+    fn generate_ascii_tree_renders_hierarchy() {
+        let mut plan = CruisePlan::new("test");
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "Root"),
+            CruiseTask::new("CRUISE-002", "Child A")
+                .with_blocked_by(vec!["CRUISE-001".to_string()]),
+            CruiseTask::new("CRUISE-003", "Child B")
+                .with_blocked_by(vec!["CRUISE-001".to_string()]),
+        ];
+
+        let tree = generate_ascii_tree(&plan);
+
+        assert!(tree.contains("CRUISE-001 (Root)"));
+        assert!(tree.contains("CRUISE-002 (Child A)"));
+        assert!(tree.contains("CRUISE-003 (Child B)"));
     }
 }
