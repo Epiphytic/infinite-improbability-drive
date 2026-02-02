@@ -1,0 +1,16 @@
+name: smoke-hello
+description: Minimal smoke test - create a single file
+runner: claude
+
+prompt: |
+  Create a file called hello.txt containing exactly:
+  Hello, World!
+
+validation:
+  level: file_exists
+  expected_files:
+    - hello.txt
+  expected_content:
+    hello.txt: "Hello, World!"
+
+timeout: 60

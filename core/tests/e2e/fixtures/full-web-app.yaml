@@ -1,0 +1,34 @@
+name: full-web-app
+description: Complete web application with authentication and tests
+runner: claude
+
+prompt: |
+  Build a web application that is a simple web UI to an SQLite database.
+
+  Requirements:
+  - Use Rust with Axum for the web framework
+  - SQLite database for storage
+  - JWT authentication using a locally generated private key
+  - REST API for CRUD operations on a "notes" table (id, title, content, created_at)
+  - Simple HTML UI for login and viewing/creating notes
+  - Unit tests for the authentication logic
+  - Integration tests that show the ability to add and delete notes through the API
+  - E2E test of login flow using the test client
+
+  The application should:
+  1. Compile with `cargo build`
+  2. Pass unit tests with `cargo test --lib`
+  3. Pass integration tests with `cargo test --test integration`
+
+validation:
+  level: full
+  expected_files:
+    - Cargo.toml
+    - src/main.rs
+    - src/lib.rs
+    - tests/integration.rs
+  build_command: cargo build --release
+  test_command: cargo test --lib
+  e2e_command: cargo test --test integration
+
+timeout: 1800
