@@ -1,24 +1,25 @@
 name: full-web-app
-description: Complete web application with authentication and tests
+description: Simple Rust CLI app with library
 runner: claude
 
 prompt: |
-  Build a web application that is a simple web UI to an SQLite database.
+  Create a simple Rust project with the following files:
 
-  Requirements:
-  - Use Rust with Axum for the web framework
-  - SQLite database for storage
-  - JWT authentication using a locally generated private key
-  - REST API for CRUD operations on a "notes" table (id, title, content, created_at)
-  - Simple HTML UI for login and viewing/creating notes
-  - Unit tests for the authentication logic
-  - Integration tests that show the ability to add and delete notes through the API
-  - E2E test of login flow using the test client
+  1. Cargo.toml - A valid Cargo manifest with name "myapp" and edition 2021
 
-  The application should:
-  1. Compile with `cargo build`
-  2. Pass unit tests with `cargo test --lib`
-  3. Pass integration tests with `cargo test --test integration`
+  2. src/main.rs - A main function that:
+     - Calls a function from lib.rs
+     - Prints the result
+
+  3. src/lib.rs - A library with:
+     - A public function called "add" that takes two i32 and returns their sum
+     - A public function called "greet" that takes a &str name and returns "Hello, {name}!"
+
+  4. tests/integration.rs - Integration tests that:
+     - Test the add function with various inputs
+     - Test the greet function
+
+  Just create the files. The project should compile and pass tests.
 
 validation:
   level: full
@@ -31,4 +32,4 @@ validation:
   test_command: cargo test --lib
   e2e_command: cargo test --test integration
 
-timeout: 1800
+timeout: 300

@@ -3,6 +3,7 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
+use serde_json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -44,6 +45,10 @@ impl ClaudeRunner {
             "--print".to_string(), // Non-interactive mode
             // Skip permissions since we're in a sandbox - the sandbox provides isolation
             "--dangerously-skip-permissions".to_string(),
+            // Use stream-json for structured output that shows tool calls
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(), // Required for stream-json
         ];
 
         // Add model if specified
@@ -105,6 +110,9 @@ impl LLMRunner for ClaudeRunner {
                         Ok(Some(line)) => {
                             output_lines += 1;
 
+                            // Debug log to see what we're receiving
+                            tracing::debug!(line = %line, "claude stdout");
+
                             // Check for tool calls and file operations
                             let output = self.parse_output_line(&line);
                             if output_tx.send(output).await.is_err() {
@@ -155,75 +163,90 @@ impl LLMRunner for ClaudeRunner {
 }
 
 impl ClaudeRunner {
-    /// Parses an output line to detect tool calls and file operations.
+    /// Parses an output line (JSON from stream-json format) to detect tool calls and file operations.
     fn parse_output_line(&self, line: &str) -> LLMOutput {
-        // Detect Read tool calls
-        if line.contains("Read(") || line.contains("reading file") {
-            if let Some(path) = self.extract_path(line) {
-                return LLMOutput::FileRead(path.into());
+        // Try to parse as JSON first (stream-json format)
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            // Check for tool use in assistant messages
+            if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                if let Some(content) = json
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for item in content {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let tool_name = item
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            // Extract file path from input if present
+                            if let Some(input) = item.get("input") {
+                                let file_path = input
+                                    .get("file_path")
+                                    .and_then(|p| p.as_str())
+                                    .map(|s| s.to_string());
+
+                                match tool_name.as_str() {
+                                    "Read" => {
+                                        if let Some(path) = file_path {
+                                            return LLMOutput::FileRead(path.into());
+                                        }
+                                    }
+                                    "Write" | "Edit" | "NotebookEdit" => {
+                                        if let Some(path) = file_path {
+                                            return LLMOutput::FileWrite(path.into());
+                                        }
+                                    }
+                                    _ => {
+                                        let args = input.to_string();
+                                        return LLMOutput::ToolCall {
+                                            tool: tool_name,
+                                            args,
+                                        };
+                                    }
+                                }
+                            }
+
+                            return LLMOutput::ToolCall {
+                                tool: tool_name,
+                                args: String::new(),
+                            };
+                        }
+                    }
+                }
             }
+
+            // Check for tool_use_result (shows completed file operations)
+            if json.get("type").and_then(|t| t.as_str()) == Some("user") {
+                if let Some(result) = json.get("tool_use_result") {
+                    let result_type = result
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+
+                    if let Some(file_path) = result.get("filePath").and_then(|p| p.as_str()) {
+                        match result_type {
+                            "create" | "update" => {
+                                return LLMOutput::FileWrite(file_path.into());
+                            }
+                            "read" => {
+                                return LLMOutput::FileRead(file_path.into());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // For other JSON messages, just return as stdout
+            return LLMOutput::Stdout(line.to_string());
         }
 
-        // Detect Write/Edit tool calls
-        if line.contains("Write(") || line.contains("Edit(") || line.contains("writing file") {
-            if let Some(path) = self.extract_path(line) {
-                return LLMOutput::FileWrite(path.into());
-            }
-        }
-
-        // Detect generic tool calls
-        if line.contains("Tool:") || line.contains("using tool") {
-            if let Some((tool, args)) = self.extract_tool_call(line) {
-                return LLMOutput::ToolCall { tool, args };
-            }
-        }
-
+        // Fallback: not JSON, return as raw output
         LLMOutput::Stdout(line.to_string())
-    }
-
-    /// Extracts a file path from output.
-    fn extract_path(&self, line: &str) -> Option<String> {
-        // Look for paths in quotes or after known patterns
-        if let Some(start) = line.find('"') {
-            if let Some(end) = line[start + 1..].find('"') {
-                let path = &line[start + 1..start + 1 + end];
-                if path.contains('/') || path.contains('\\') {
-                    return Some(path.to_string());
-                }
-            }
-        }
-
-        if let Some(start) = line.find('\'') {
-            if let Some(end) = line[start + 1..].find('\'') {
-                let path = &line[start + 1..start + 1 + end];
-                if path.contains('/') || path.contains('\\') {
-                    return Some(path.to_string());
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Extracts a tool call from output.
-    fn extract_tool_call(&self, line: &str) -> Option<(String, String)> {
-        // Pattern: "Tool: ToolName(args)" or "using tool ToolName"
-        if line.contains("Tool:") {
-            let parts: Vec<&str> = line.split("Tool:").collect();
-            if parts.len() > 1 {
-                let rest = parts[1].trim();
-                if let Some(paren) = rest.find('(') {
-                    let tool = rest[..paren].trim().to_string();
-                    let end = rest.rfind(')').unwrap_or(rest.len());
-                    let args = rest[paren + 1..end].to_string();
-                    return Some((tool, args));
-                } else {
-                    return Some((rest.to_string(), String::new()));
-                }
-            }
-        }
-
-        None
     }
 }
 
@@ -283,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_runner_parses_stdout_line() {
+    fn claude_runner_parses_non_json_as_stdout() {
         let runner = ClaudeRunner::new();
 
         let output = runner.parse_output_line("Just some regular output");
@@ -291,31 +314,55 @@ mod tests {
     }
 
     #[test]
-    fn claude_runner_detects_file_read() {
+    fn claude_runner_parses_json_write_tool_use() {
         let runner = ClaudeRunner::new();
 
-        let output = runner.parse_output_line("Read(\"/src/main.rs\")");
-        assert!(matches!(output, LLMOutput::FileRead(_)));
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/src/main.rs","content":"test"}}]}}"#;
+        let output = runner.parse_output_line(json);
+        if let LLMOutput::FileWrite(path) = output {
+            assert_eq!(path.to_string_lossy(), "/src/main.rs");
+        } else {
+            panic!("Expected FileWrite, got {:?}", output);
+        }
     }
 
     #[test]
-    fn claude_runner_detects_file_write() {
+    fn claude_runner_parses_json_read_tool_use() {
         let runner = ClaudeRunner::new();
 
-        let output = runner.parse_output_line("Write(\"/src/new_file.rs\")");
-        assert!(matches!(output, LLMOutput::FileWrite(_)));
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/lib.rs"}}]}}"#;
+        let output = runner.parse_output_line(json);
+        if let LLMOutput::FileRead(path) = output {
+            assert_eq!(path.to_string_lossy(), "/src/lib.rs");
+        } else {
+            panic!("Expected FileRead, got {:?}", output);
+        }
     }
 
     #[test]
-    fn claude_runner_detects_tool_call() {
+    fn claude_runner_parses_json_tool_use_result_create() {
         let runner = ClaudeRunner::new();
 
-        let output = runner.parse_output_line("Tool: Bash(ls -la)");
+        let json = r#"{"type":"user","tool_use_result":{"type":"create","filePath":"/test/file.txt"}}"#;
+        let output = runner.parse_output_line(json);
+        if let LLMOutput::FileWrite(path) = output {
+            assert_eq!(path.to_string_lossy(), "/test/file.txt");
+        } else {
+            panic!("Expected FileWrite, got {:?}", output);
+        }
+    }
+
+    #[test]
+    fn claude_runner_parses_json_generic_tool_call() {
+        let runner = ClaudeRunner::new();
+
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}"#;
+        let output = runner.parse_output_line(json);
         if let LLMOutput::ToolCall { tool, args } = output {
             assert_eq!(tool, "Bash");
-            assert_eq!(args, "ls -la");
+            assert!(args.contains("ls -la"));
         } else {
-            panic!("Expected ToolCall");
+            panic!("Expected ToolCall, got {:?}", output);
         }
     }
 
