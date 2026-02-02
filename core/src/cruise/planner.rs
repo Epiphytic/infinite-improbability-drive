@@ -153,6 +153,52 @@ fn extract_json(output: &str) -> Option<&str> {
     }
 }
 
+/// Validates a parsed plan for completeness and correctness.
+pub fn validate_plan(plan: &CruisePlan) -> Result<()> {
+    // Check for empty plan
+    if plan.tasks.is_empty() {
+        return Err(Error::Cruise("Plan produced no tasks".to_string()));
+    }
+
+    // Check for empty title
+    if plan.title.trim().is_empty() {
+        return Err(Error::Cruise("Plan has no title".to_string()));
+    }
+
+    // Check for dependency cycles
+    if let Some(cycle) = plan.has_cycle() {
+        return Err(Error::DependencyCycle(cycle));
+    }
+
+    // Validate each task
+    for task in &plan.tasks {
+        // Check ID format
+        if !task.id.starts_with("CRUISE-") {
+            return Err(Error::Cruise(format!(
+                "Task ID '{}' must use CRUISE-XXX format",
+                task.id
+            )));
+        }
+
+        // Check for empty subject
+        if task.subject.trim().is_empty() {
+            return Err(Error::Cruise(format!("Task {} has no subject", task.id)));
+        }
+
+        // Check for unknown dependencies
+        for dep in &task.blocked_by {
+            if !plan.tasks.iter().any(|t| &t.id == dep) {
+                return Err(Error::Cruise(format!(
+                    "Task {} depends on unknown task {}",
+                    task.id, dep
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +322,76 @@ Here's my plan:
     fn extract_json_finds_raw_json() {
         let output = "prefix {\"a\": 1} suffix";
         assert_eq!(extract_json(output), Some("{\"a\": 1}"));
+    }
+
+    #[test]
+    fn validate_plan_accepts_valid_plan() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Valid Plan".to_string();
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "First task"),
+            CruiseTask::new("CRUISE-002", "Second task")
+                .with_blocked_by(vec!["CRUISE-001".to_string()]),
+        ];
+
+        assert!(validate_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn validate_plan_rejects_empty_plan() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Empty".to_string();
+
+        let result = validate_plan(&plan);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no tasks"));
+    }
+
+    #[test]
+    fn validate_plan_rejects_empty_title() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "   ".to_string();
+        plan.tasks = vec![CruiseTask::new("CRUISE-001", "Task")];
+
+        let result = validate_plan(&plan);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no title"));
+    }
+
+    #[test]
+    fn validate_plan_rejects_invalid_id_format() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Test".to_string();
+        plan.tasks = vec![CruiseTask::new("TASK-001", "Bad ID")];
+
+        let result = validate_plan(&plan);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("CRUISE-XXX"));
+    }
+
+    #[test]
+    fn validate_plan_rejects_unknown_dependency() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Test".to_string();
+        plan.tasks =
+            vec![CruiseTask::new("CRUISE-001", "Task")
+                .with_blocked_by(vec!["CRUISE-999".to_string()])];
+
+        let result = validate_plan(&plan);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown task"));
+    }
+
+    #[test]
+    fn validate_plan_rejects_cycle() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Test".to_string();
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "A").with_blocked_by(vec!["CRUISE-002".to_string()]),
+            CruiseTask::new("CRUISE-002", "B").with_blocked_by(vec!["CRUISE-001".to_string()]),
+        ];
+
+        let result = validate_plan(&plan);
+        assert!(result.is_err());
     }
 }
