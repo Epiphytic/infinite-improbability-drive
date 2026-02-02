@@ -6,9 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use super::config::PlanningConfig;
+use super::result::PlanResult;
 use super::task::{CruisePlan, CruiseTask, TaskComplexity, TaskStatus};
 use crate::error::{Error, Result};
 
@@ -64,6 +67,65 @@ impl ReviewPhase {
                  Clarity, completeness, feasibility concerns?"
             }
         }
+    }
+}
+
+/// Planner for cruise-control plan generation.
+pub struct Planner {
+    config: PlanningConfig,
+}
+
+impl Planner {
+    /// Creates a new planner with the given configuration.
+    pub fn new(config: PlanningConfig) -> Self {
+        Self { config }
+    }
+
+    /// Creates a planner with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(PlanningConfig::default())
+    }
+
+    /// Returns the planning configuration.
+    pub fn config(&self) -> &PlanningConfig {
+        &self.config
+    }
+
+    /// Runs planning in dry-run mode (no PR creation).
+    ///
+    /// This is useful for testing the planning logic without
+    /// creating actual PRs or writing files.
+    pub fn plan_dry_run(&self, prompt: &str) -> Result<CruisePlan> {
+        // For now, just validate that we can parse a mock response
+        // Full implementation will integrate with spawn-team
+        let _ = prompt;
+        Err(Error::Cruise(
+            "Planner not yet integrated with spawn-team".to_string(),
+        ))
+    }
+
+    /// Runs the full planning phase.
+    ///
+    /// This orchestrates spawn-team ping-pong iterations,
+    /// validates the result, writes beads issues, generates
+    /// markdown, and creates a PR for approval.
+    pub async fn plan(&self, prompt: &str, work_dir: &Path) -> Result<PlanResult> {
+        let start = Instant::now();
+
+        // TODO: Integrate with spawn-team ping-pong
+        // For now, return a placeholder result
+        let _ = prompt;
+        let _ = work_dir;
+
+        Ok(PlanResult {
+            success: false,
+            iterations: 0,
+            task_count: 0,
+            pr_url: None,
+            duration: start.elapsed(),
+            plan_file: None,
+            error: Some("Planner not yet integrated with spawn-team".to_string()),
+        })
     }
 }
 
@@ -878,5 +940,18 @@ Here's my plan:
         assert!(tree.contains("CRUISE-001 (Root)"));
         assert!(tree.contains("CRUISE-002 (Child A)"));
         assert!(tree.contains("CRUISE-003 (Child B)"));
+    }
+
+    #[test]
+    fn planner_can_be_created() {
+        let planner = Planner::with_defaults();
+        assert_eq!(planner.config().ping_pong_iterations, 5);
+    }
+
+    #[test]
+    fn planner_dry_run_returns_error_until_integrated() {
+        let planner = Planner::with_defaults();
+        let result = planner.plan_dry_run("test prompt");
+        assert!(result.is_err());
     }
 }

@@ -35,9 +35,11 @@ pub use config::{
     KNOWN_LLMS, KNOWN_TOOLS,
 };
 pub use cruise::{
-    AdherenceCheck, AdherenceStatus, ApprovalConfig, AuditFinding, BuildResult, BuildingConfig,
-    CruiseConfig, CruisePlan, CruiseResult, CruiseTask, FindingSeverity, FunctionalTestResult,
-    PlanResult, PlanningConfig, PrStrategy, RepoLifecycle, TaskComplexity, TaskResult, TaskStatus,
-    TestConfig, TestLevel, ValidationConfig as CruiseValidationConfig,
+    generate_plan_markdown, generate_pr_body, parse_plan_json, plan_to_beads,
+    validate_plan as validate_cruise_plan, AdherenceCheck, AdherenceStatus, ApprovalConfig,
+    AuditFinding, BuildResult, BuildingConfig, CruiseConfig, CruisePlan, CruiseResult, CruiseTask,
+    FindingSeverity, FunctionalTestResult, PlanPromptBuilder, PlanResult, Planner, PlanningConfig,
+    PlanReviewPromptBuilder, PrStrategy, RepoLifecycle, ReviewPhase, TaskComplexity, TaskResult,
+    TaskStatus, TestConfig, TestLevel, ValidationConfig as CruiseValidationConfig,
     ValidationResult as CruiseValidationResult,
 };
