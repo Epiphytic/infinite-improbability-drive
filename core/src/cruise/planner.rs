@@ -3,9 +3,12 @@
 //! Uses spawn-team ping-pong with phased reviews to generate
 //! dependency-aware plans as beads issues.
 
+use std::fs;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
-use super::task::{CruisePlan, CruiseTask, TaskComplexity};
+use super::task::{CruisePlan, CruiseTask, TaskComplexity, TaskStatus};
 use crate::error::{Error, Result};
 
 /// Review phase for plan iteration.
@@ -197,6 +200,91 @@ pub fn validate_plan(plan: &CruisePlan) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Writes a CruisePlan as beads issues to the given directory.
+pub fn plan_to_beads(plan: &CruisePlan, beads_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    // Create .beads directory if needed
+    fs::create_dir_all(beads_dir)
+        .map_err(|e| Error::Cruise(format!("Failed to create beads directory: {}", e)))?;
+
+    let mut written_files = Vec::new();
+
+    for task in &plan.tasks {
+        let filename = format!("{}.md", task.id);
+        let filepath = beads_dir.join(&filename);
+
+        let content = format_beads_issue(task);
+
+        fs::write(&filepath, content)
+            .map_err(|e| Error::Cruise(format!("Failed to write {}: {}", filename, e)))?;
+
+        written_files.push(filepath);
+    }
+
+    Ok(written_files)
+}
+
+/// Formats a CruiseTask as a beads issue markdown file.
+fn format_beads_issue(task: &CruiseTask) -> String {
+    let mut content = String::new();
+
+    // YAML frontmatter
+    content.push_str("---\n");
+    content.push_str(&format!("id: {}\n", task.id));
+    content.push_str(&format!("subject: {}\n", task.subject));
+    content.push_str(&format!("status: {}\n", format_status(&task.status)));
+
+    if !task.blocked_by.is_empty() {
+        content.push_str("blockedBy:\n");
+        for dep in &task.blocked_by {
+            content.push_str(&format!("  - {}\n", dep));
+        }
+    } else {
+        content.push_str("blockedBy: []\n");
+    }
+
+    if let Some(component) = &task.component {
+        content.push_str(&format!("component: {}\n", component));
+    }
+
+    content.push_str(&format!(
+        "complexity: {}\n",
+        format_complexity(&task.complexity)
+    ));
+    content.push_str("---\n\n");
+
+    // Body
+    content.push_str(&format!("# {}\n\n", task.subject));
+    content.push_str(&task.description);
+    content.push('\n');
+
+    if !task.acceptance_criteria.is_empty() {
+        content.push_str("\n## Acceptance Criteria\n\n");
+        for criterion in &task.acceptance_criteria {
+            content.push_str(&format!("- [ ] {}\n", criterion));
+        }
+    }
+
+    content
+}
+
+fn format_status(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Skipped => "skipped",
+    }
+}
+
+fn format_complexity(complexity: &TaskComplexity) -> &'static str {
+    match complexity {
+        TaskComplexity::Low => "low",
+        TaskComplexity::Medium => "medium",
+        TaskComplexity::High => "high",
+    }
 }
 
 #[cfg(test)]
@@ -393,5 +481,64 @@ Here's my plan:
 
         let result = validate_plan(&plan);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn plan_to_beads_creates_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+
+        let mut plan = CruisePlan::new("test");
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "First task")
+                .with_description("Do the first thing")
+                .with_component("core"),
+            CruiseTask::new("CRUISE-002", "Second task")
+                .with_blocked_by(vec!["CRUISE-001".to_string()]),
+        ];
+
+        let files = plan_to_beads(&plan, &beads_dir).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(beads_dir.join("CRUISE-001.md").exists());
+        assert!(beads_dir.join("CRUISE-002.md").exists());
+    }
+
+    #[test]
+    fn format_beads_issue_includes_frontmatter() {
+        let task = CruiseTask::new("CRUISE-001", "Test task")
+            .with_description("Description here")
+            .with_component("testing")
+            .with_complexity(TaskComplexity::High)
+            .with_blocked_by(vec!["CRUISE-000".to_string()]);
+
+        let content = format_beads_issue(&task);
+
+        assert!(content.starts_with("---\n"));
+        assert!(content.contains("id: CRUISE-001"));
+        assert!(content.contains("subject: Test task"));
+        assert!(content.contains("status: pending"));
+        assert!(content.contains("component: testing"));
+        assert!(content.contains("complexity: high"));
+        assert!(content.contains("- CRUISE-000"));
+        assert!(content.contains("# Test task"));
+        assert!(content.contains("Description here"));
+    }
+
+    #[test]
+    fn format_beads_issue_includes_acceptance_criteria() {
+        let mut task = CruiseTask::new("CRUISE-001", "Task");
+        task.acceptance_criteria = vec![
+            "First criterion".to_string(),
+            "Second criterion".to_string(),
+        ];
+
+        let content = format_beads_issue(&task);
+
+        assert!(content.contains("## Acceptance Criteria"));
+        assert!(content.contains("- [ ] First criterion"));
+        assert!(content.contains("- [ ] Second criterion"));
     }
 }
