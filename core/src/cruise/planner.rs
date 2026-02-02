@@ -3,6 +3,7 @@
 //! Uses spawn-team ping-pong with phased reviews to generate
 //! dependency-aware plans as beads issues.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -287,6 +288,114 @@ fn format_complexity(complexity: &TaskComplexity) -> &'static str {
     }
 }
 
+/// Generates a markdown plan document from a CruisePlan.
+pub fn generate_plan_markdown(plan: &CruisePlan) -> String {
+    let mut md = String::new();
+
+    // Title and overview
+    md.push_str(&format!("# {}\n\n", plan.title));
+    md.push_str("## Overview\n\n");
+    md.push_str(&plan.overview);
+    md.push_str("\n\n");
+
+    // Dependency graph (mermaid)
+    md.push_str("## Dependency Graph\n\n");
+    md.push_str("```mermaid\n");
+    md.push_str("graph TD\n");
+    for task in &plan.tasks {
+        let label = task.subject.replace('"', "'");
+        if task.blocked_by.is_empty() {
+            md.push_str(&format!("    {}[\"{}\"]\n", task.id, label));
+        } else {
+            for dep in &task.blocked_by {
+                md.push_str(&format!("    {} --> {}\n", dep, task.id));
+            }
+        }
+    }
+    md.push_str("```\n\n");
+
+    // Tasks table
+    md.push_str("## Tasks\n\n");
+    for task in &plan.tasks {
+        md.push_str(&format!("### {}: {}\n\n", task.id, task.subject));
+        if let Some(component) = &task.component {
+            md.push_str(&format!("- **Component**: {}\n", component));
+        }
+        md.push_str(&format!("- **Complexity**: {:?}\n", task.complexity));
+        if task.blocked_by.is_empty() {
+            md.push_str("- **Dependencies**: none\n");
+        } else {
+            md.push_str(&format!(
+                "- **Dependencies**: {}\n",
+                task.blocked_by.join(", ")
+            ));
+        }
+        md.push('\n');
+        md.push_str(&task.description);
+        md.push_str("\n\n");
+    }
+
+    // Parallel execution groups
+    md.push_str("## Parallel Execution Groups\n\n");
+    let waves = compute_execution_waves(plan);
+    for (i, wave) in waves.iter().enumerate() {
+        let task_ids: Vec<&str> = wave.iter().map(|s| s.as_str()).collect();
+        if wave.len() > 1 {
+            md.push_str(&format!(
+                "- **Wave {}**: {} *(parallel)*\n",
+                i + 1,
+                task_ids.join(", ")
+            ));
+        } else {
+            md.push_str(&format!("- **Wave {}**: {}\n", i + 1, task_ids.join(", ")));
+        }
+    }
+    md.push('\n');
+
+    // Risk areas
+    if !plan.risks.is_empty() {
+        md.push_str("## Risk Areas\n\n");
+        for risk in &plan.risks {
+            md.push_str(&format!("- {}\n", risk));
+        }
+    }
+
+    md
+}
+
+/// Computes execution waves (groups of tasks that can run in parallel).
+fn compute_execution_waves(plan: &CruisePlan) -> Vec<Vec<String>> {
+    let mut waves: Vec<Vec<String>> = Vec::new();
+    let mut completed: HashSet<String> = HashSet::new();
+    let mut remaining: Vec<&CruiseTask> = plan.tasks.iter().collect();
+
+    while !remaining.is_empty() {
+        // Find tasks with all dependencies satisfied
+        let ready: Vec<String> = remaining
+            .iter()
+            .filter(|t| t.blocked_by.iter().all(|dep| completed.contains(dep)))
+            .map(|t| t.id.clone())
+            .collect();
+
+        if ready.is_empty() {
+            // Shouldn't happen if plan is valid, but avoid infinite loop
+            break;
+        }
+
+        // Add ready tasks to completed
+        for id in &ready {
+            completed.insert(id.clone());
+        }
+
+        // Remove ready tasks from remaining
+        remaining.retain(|t| !ready.contains(&t.id));
+
+        waves.push(ready);
+    }
+
+    waves
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +649,55 @@ Here's my plan:
         assert!(content.contains("## Acceptance Criteria"));
         assert!(content.contains("- [ ] First criterion"));
         assert!(content.contains("- [ ] Second criterion"));
+    }
+
+    #[test]
+    fn generate_plan_markdown_includes_all_sections() {
+        let mut plan = CruisePlan::new("test");
+        plan.title = "Test Plan".to_string();
+        plan.overview = "This is the overview.".to_string();
+        plan.risks = vec!["Risk one".to_string()];
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "First task")
+                .with_description("Do first")
+                .with_component("core"),
+            CruiseTask::new("CRUISE-002", "Second task")
+                .with_description("Do second")
+                .with_blocked_by(vec!["CRUISE-001".to_string()]),
+        ];
+
+        let md = generate_plan_markdown(&plan);
+
+        assert!(md.contains("# Test Plan"));
+        assert!(md.contains("## Overview"));
+        assert!(md.contains("This is the overview."));
+        assert!(md.contains("## Dependency Graph"));
+        assert!(md.contains("```mermaid"));
+        assert!(md.contains("CRUISE-001 --> CRUISE-002"));
+        assert!(md.contains("## Tasks"));
+        assert!(md.contains("### CRUISE-001: First task"));
+        assert!(md.contains("## Parallel Execution Groups"));
+        assert!(md.contains("## Risk Areas"));
+        assert!(md.contains("Risk one"));
+    }
+
+    #[test]
+    fn compute_execution_waves_groups_parallel_tasks() {
+        let mut plan = CruisePlan::new("test");
+        plan.tasks = vec![
+            CruiseTask::new("CRUISE-001", "A"),
+            CruiseTask::new("CRUISE-002", "B").with_blocked_by(vec!["CRUISE-001".to_string()]),
+            CruiseTask::new("CRUISE-003", "C").with_blocked_by(vec!["CRUISE-001".to_string()]),
+            CruiseTask::new("CRUISE-004", "D")
+                .with_blocked_by(vec!["CRUISE-002".to_string(), "CRUISE-003".to_string()]),
+        ];
+
+        let waves = compute_execution_waves(&plan);
+
+        assert_eq!(waves.len(), 3);
+        assert_eq!(waves[0], vec!["CRUISE-001"]);
+        assert!(waves[1].contains(&"CRUISE-002".to_string()));
+        assert!(waves[1].contains(&"CRUISE-003".to_string()));
+        assert_eq!(waves[2], vec!["CRUISE-004"]);
     }
 }
