@@ -72,6 +72,12 @@ pub trait SandboxProvider: Send + Sync {
 
     /// Creates a new sandbox with the given manifest.
     fn create(&self, manifest: SandboxManifest) -> Result<Self::Sandbox>;
+
+    /// Returns the path to the repository root.
+    ///
+    /// This is used for checking repo state before launching LLMs
+    /// (e.g., checking for .gitignore).
+    fn repo_path(&self) -> &PathBuf;
 }
 
 #[cfg(test)]

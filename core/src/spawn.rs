@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::monitor::TimeoutConfig;
+use crate::prompt::augment_prompt_with_gitignore;
 use crate::runner::LLMRunner;
 use crate::sandbox::{SandboxManifest, SandboxProvider};
 use crate::watcher::{RecoveryStrategy, TerminationReason, WatcherAgent, WatcherConfig};
@@ -219,10 +220,14 @@ impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
 
         let start_time = std::time::Instant::now();
 
+        // Augment prompt with gitignore instruction if needed
+        let prompt = augment_prompt_with_gitignore(&config.prompt, self.provider.repo_path());
+
         tracing::info!(
             spawn_id = %spawn_id,
             mode = ?config.mode,
             runner = %runner.name(),
+            prompt_augmented = (prompt != config.prompt),
             "starting spawn with watcher"
         );
 
@@ -232,8 +237,8 @@ impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
         // Create watcher agent
         let watcher = WatcherAgent::new(self.provider.clone(), runner, watcher_config);
 
-        // Run the watcher
-        let watcher_result = watcher.run(config.prompt.clone(), manifest).await?;
+        // Run the watcher with potentially augmented prompt
+        let watcher_result = watcher.run(prompt, manifest).await?;
 
         let duration = start_time.elapsed();
 

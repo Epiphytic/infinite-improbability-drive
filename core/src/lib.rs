@@ -10,6 +10,7 @@ pub mod error;
 pub mod monitor;
 pub mod permissions;
 pub mod pr;
+pub mod prompt;
 pub mod runner;
 pub mod sandbox;
 pub mod secrets;
@@ -24,6 +25,7 @@ pub use pr::{ConflictFile, ConflictStrategy, MergeStatus, PRManager, PullRequest
 pub use runner::{ClaudeRunner, GeminiRunner, LLMOutput, LLMResult, LLMRunner, LLMSpawnConfig};
 pub use sandbox::{Sandbox, SandboxManifest, SandboxProvider};
 pub use secrets::{SecretError, SecretRef, SecretSource, SecretsManager};
+pub use prompt::{augment_prompt_with_gitignore, has_gitignore, prompt_mentions_gitignore};
 pub use spawn::{SpawnConfig, SpawnResult, SpawnStatus};
 pub use team::{
     CoordinationMode, FixPromptBuilder, ReviewPromptBuilder, ReviewResult, ReviewSuggestion,

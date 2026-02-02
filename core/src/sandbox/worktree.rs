@@ -135,6 +135,10 @@ impl WorktreeSandbox {
 impl SandboxProvider for WorktreeSandbox {
     type Sandbox = WorktreeSandboxInstance;
 
+    fn repo_path(&self) -> &PathBuf {
+        &self.repo_path
+    }
+
     fn create(&self, manifest: SandboxManifest) -> Result<Self::Sandbox> {
         let branch_name = self.generate_branch_name();
         let worktree_path = self.get_worktree_path(&branch_name)?;

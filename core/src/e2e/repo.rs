@@ -21,12 +21,31 @@ pub struct EphemeralRepo {
 
 impl EphemeralRepo {
     /// Creates a new ephemeral repository.
+    ///
+    /// The `prefix` is typically "e2e" and `test_name` is the fixture/test name.
+    /// Resulting repo name format: `{prefix}-{test_name}-{short_uuid}`
     pub fn create(org: &str, prefix: &str) -> Result<Self> {
-        let name = format!(
-            "{}-{}",
-            prefix,
-            uuid::Uuid::new_v4().to_string()[..8].to_string()
-        );
+        Self::create_with_name(org, prefix, None)
+    }
+
+    /// Creates a new ephemeral repository with a specific test name.
+    ///
+    /// The `test_name` is included in the repo name for clarity.
+    /// Resulting repo name format: `{prefix}-{test_name}-{short_uuid}`
+    pub fn create_with_name(org: &str, prefix: &str, test_name: Option<&str>) -> Result<Self> {
+        let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
+        let name = match test_name {
+            Some(test) => {
+                // Sanitize test name for use in repo name (replace non-alphanumeric with dash)
+                let sanitized: String = test
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                    .collect::<String>()
+                    .to_lowercase();
+                format!("{}-{}-{}", prefix, sanitized, short_uuid)
+            }
+            None => format!("{}-{}", prefix, short_uuid),
+        };
         let full_name = format!("{}/{}", org, name);
 
         tracing::info!(repo = %full_name, "creating ephemeral repository");

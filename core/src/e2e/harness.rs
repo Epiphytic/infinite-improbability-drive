@@ -107,8 +107,8 @@ impl E2EHarness {
     async fn run_simple_workflow(&self, fixture: &Fixture) -> E2EResult {
         let fixture_name = fixture.name.clone();
 
-        // Create ephemeral repo
-        let mut repo = match EphemeralRepo::create(&self.config.org, "e2e") {
+        // Create ephemeral repo with fixture name for clarity
+        let mut repo = match EphemeralRepo::create_with_name(&self.config.org, "e2e", Some(&fixture.name)) {
             Ok(r) => r,
             Err(e) => {
                 return E2EResult {
@@ -279,8 +279,8 @@ impl E2EHarness {
     async fn run_full_workflow(&self, fixture: &Fixture) -> E2EResult {
         let fixture_name = fixture.name.clone();
 
-        // Create ephemeral repo
-        let mut repo = match EphemeralRepo::create(&self.config.org, "e2e") {
+        // Create ephemeral repo with fixture name for clarity
+        let mut repo = match EphemeralRepo::create_with_name(&self.config.org, "e2e", Some(&fixture.name)) {
             Ok(r) => r,
             Err(e) => {
                 return E2EResult {
