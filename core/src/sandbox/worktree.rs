@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -83,13 +84,14 @@ impl Drop for WorktreeSandboxInstance {
 }
 
 /// Provider that creates sandboxes using git worktrees.
+#[derive(Clone)]
 pub struct WorktreeSandbox {
     /// Path to the git repository.
     repo_path: PathBuf,
     /// Base directory for worktrees. If None, uses a temp directory.
     base_dir: Option<PathBuf>,
-    /// Counter for generating unique branch names.
-    counter: std::sync::atomic::AtomicU64,
+    /// Counter for generating unique branch names (shared across clones).
+    counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorktreeSandbox {
@@ -102,7 +104,7 @@ impl WorktreeSandbox {
         Self {
             repo_path,
             base_dir,
-            counter: std::sync::atomic::AtomicU64::new(0),
+            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

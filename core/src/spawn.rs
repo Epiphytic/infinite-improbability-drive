@@ -8,8 +8,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::monitor::TimeoutConfig;
 use crate::runner::LLMRunner;
-use crate::sandbox::{Sandbox, SandboxManifest, SandboxProvider};
+use crate::sandbox::{SandboxManifest, SandboxProvider};
+use crate::watcher::{RecoveryStrategy, TerminationReason, WatcherAgent, WatcherConfig};
 
 /// Mode for prompt handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -88,6 +90,19 @@ impl SpawnConfig {
     }
 }
 
+impl From<&SpawnConfig> for WatcherConfig {
+    fn from(config: &SpawnConfig) -> Self {
+        Self {
+            timeout: TimeoutConfig {
+                idle_timeout: config.idle_timeout,
+                total_timeout: config.total_timeout,
+            },
+            recovery_strategy: RecoveryStrategy::Moderate,
+            max_escalations: config.max_permission_escalations,
+        }
+    }
+}
+
 /// Status of a completed spawn operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -153,12 +168,12 @@ pub struct SpawnResult {
 }
 
 /// Spawner that creates and manages sandboxed LLM instances.
-pub struct Spawner<P: SandboxProvider> {
+pub struct Spawner<P: SandboxProvider + Clone> {
     provider: P,
     logs_dir: PathBuf,
 }
 
-impl<P: SandboxProvider> Spawner<P> {
+impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
     /// Creates a new spawner with the given sandbox provider.
     pub fn new(provider: P, logs_dir: PathBuf) -> Self {
         Self { provider, logs_dir }
@@ -199,35 +214,78 @@ impl<P: SandboxProvider> Spawner<P> {
             .map_err(|e| Error::Config(format!("failed to serialize manifest: {}", e)))?;
         std::fs::write(&manifest_path, manifest_json)?;
 
-        // Create sandbox
         let start_time = std::time::Instant::now();
-        let mut sandbox = self.provider.create(manifest.clone())?;
 
         tracing::info!(
             spawn_id = %spawn_id,
-            sandbox_path = ?sandbox.path(),
             mode = ?config.mode,
             runner = %runner.name(),
-            "created spawn sandbox"
+            "starting spawn with watcher"
         );
 
-        // TODO: Phase 2 integration - WatcherAgent will be wired here
-        // For now, just clean up and return a basic result
-        let _ = runner; // Silence unused warning until watcher integration
+        // Create watcher config from spawn config
+        let watcher_config = WatcherConfig::from(&config);
+
+        // Create watcher agent
+        let watcher = WatcherAgent::new(self.provider.clone(), runner, watcher_config);
+
+        // Run the watcher
+        let watcher_result = watcher.run(config.prompt.clone(), manifest).await?;
+
         let duration = start_time.elapsed();
-        sandbox.cleanup()?;
+
+        // Convert WatcherResult to SpawnResult
+        let status = if watcher_result.success {
+            SpawnStatus::Success
+        } else {
+            match &watcher_result.termination_reason {
+                Some(TerminationReason::Timeout(_)) => SpawnStatus::TimedOut,
+                _ => SpawnStatus::Failed,
+            }
+        };
+
+        let summary = match &watcher_result.termination_reason {
+            Some(TerminationReason::Success) => {
+                format!(
+                    "Completed successfully. Files read: {}, written: {}",
+                    watcher_result.progress.files_read.len(),
+                    watcher_result.progress.files_written.len()
+                )
+            }
+            Some(TerminationReason::Timeout(reason)) => {
+                format!("Timed out: {:?}", reason)
+            }
+            Some(TerminationReason::LLMError(msg)) => {
+                format!("LLM error: {}", msg)
+            }
+            Some(TerminationReason::PermissionError(msg)) => {
+                format!("Permission error: {}", msg)
+            }
+            Some(TerminationReason::EscalationLimitReached) => {
+                "Escalation limit reached".to_string()
+            }
+            None => "Unknown termination".to_string(),
+        };
+
+        // Extract commits from progress
+        let commits = watcher_result
+            .progress
+            .commits
+            .iter()
+            .map(|c| CommitInfo {
+                hash: c.hash.clone(),
+                message: c.message.clone(),
+            })
+            .collect();
 
         Ok(SpawnResult {
-            status: SpawnStatus::Success,
+            status,
             spawn_id,
             duration,
-            files_changed: vec![],
-            commits: vec![],
-            summary: format!(
-                "Sandbox created and cleaned up successfully. Prompt: {}",
-                config.prompt
-            ),
-            pr_url: None,
+            files_changed: vec![], // TODO: Extract from watcher result
+            commits,
+            summary,
+            pr_url: None, // TODO: Extract from PR creation
             logs,
         })
     }
