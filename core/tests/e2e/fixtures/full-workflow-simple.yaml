@@ -1,0 +1,42 @@
+name: full-workflow-simple
+description: Test the full plan -> approve -> execute workflow
+runner: claude
+workflow: full
+
+# Planning prompt - generates a plan document
+planning_prompt: |
+  Create an implementation plan for building a simple greeting library in Rust.
+
+  The plan should be a markdown file called PLAN.md with:
+  1. Overview section describing what we're building
+  2. Tasks section with numbered tasks
+  3. Each task should have a description
+
+  Keep it simple - just 2-3 tasks for:
+  - Setting up Cargo.toml
+  - Creating the lib.rs with a greet function
+  - Adding a simple test
+
+  Create the PLAN.md file with this content.
+
+# Execution prompt - implements the plan
+prompt: |
+  You have a PLAN.md file in this repository. Read it and implement the plan.
+
+  Create a simple Rust project with:
+  1. Cargo.toml - name "greetlib", edition 2021
+  2. src/lib.rs - a public function `greet(name: &str) -> String` that returns "Hello, {name}!"
+  3. A test in the same file that verifies greet("World") returns "Hello, World!"
+
+  Make sure the code compiles and tests pass.
+
+validation:
+  level: test
+  expected_files:
+    - Cargo.toml
+    - src/lib.rs
+    - PLAN.md
+  build_command: cargo build
+  test_command: cargo test
+
+timeout: 300

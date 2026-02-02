@@ -15,6 +15,8 @@ pub struct EphemeralRepo {
     path: PathBuf,
     /// Whether the repo has been deleted.
     deleted: bool,
+    /// Whether to auto-delete on drop.
+    auto_delete: bool,
 }
 
 impl EphemeralRepo {
@@ -89,6 +91,7 @@ impl EphemeralRepo {
             name,
             path,
             deleted: false,
+            auto_delete: true, // Default to auto-delete
         })
     }
 
@@ -100,6 +103,16 @@ impl EphemeralRepo {
     /// Returns the local path to the repository.
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Sets whether the repository should be auto-deleted on drop.
+    pub fn set_auto_delete(&mut self, auto_delete: bool) {
+        self.auto_delete = auto_delete;
+    }
+
+    /// Keeps the repository (disables auto-delete on drop).
+    pub fn keep(&mut self) {
+        self.auto_delete = false;
     }
 
     /// Deletes the repository.
@@ -134,7 +147,7 @@ impl EphemeralRepo {
 
 impl Drop for EphemeralRepo {
     fn drop(&mut self) {
-        if !self.deleted {
+        if !self.deleted && self.auto_delete {
             let _ = self.delete();
         }
     }

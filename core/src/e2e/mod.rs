@@ -8,7 +8,7 @@ pub mod harness;
 pub mod repo;
 pub mod validator;
 
-pub use fixture::{Fixture, RunnerType, ValidationConfig, ValidationLevel};
-pub use harness::{E2EHarness, E2EResult};
+pub use fixture::{Fixture, RunnerType, ValidationConfig, ValidationLevel, WorkflowType};
+pub use harness::{E2EConfig, E2EHarness, E2EResult};
 pub use repo::EphemeralRepo;
 pub use validator::Validator;

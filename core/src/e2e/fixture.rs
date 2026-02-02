@@ -17,6 +17,17 @@ pub enum RunnerType {
     Gemini,
 }
 
+/// Workflow type for the test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowType {
+    /// Simple: run prompt directly.
+    #[default]
+    Simple,
+    /// Full: plan -> approve -> execute.
+    Full,
+}
+
 /// Validation level for test results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -87,8 +98,18 @@ pub struct Fixture {
     #[serde(default)]
     pub runner: RunnerType,
 
-    /// The prompt to send to the LLM.
+    /// Workflow type (simple or full).
+    #[serde(default)]
+    pub workflow: WorkflowType,
+
+    /// The prompt to send to the LLM (for simple workflow, this is the only prompt;
+    /// for full workflow, this is the execution prompt after plan approval).
     pub prompt: String,
+
+    /// Planning prompt for full workflow (optional).
+    /// If not provided in full workflow, a planning prompt is auto-generated from `prompt`.
+    #[serde(default)]
+    pub planning_prompt: Option<String>,
 
     /// Validation configuration.
     #[serde(default)]

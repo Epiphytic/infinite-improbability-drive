@@ -7,10 +7,13 @@
 //!
 //! Run with: `cargo test --test e2e_test`
 //! Run specific: `cargo test --test e2e_test smoke_hello`
+//!
+//! Environment variables:
+//! - `E2E_DELETE_ON_SUCCESS=1` - Delete repos even on success
 
 use std::path::PathBuf;
 
-use improbability_drive::e2e::{E2EHarness, Fixture};
+use improbability_drive::e2e::{E2EConfig, E2EHarness, Fixture};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -19,31 +22,70 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-#[tokio::test]
-#[ignore] // Run manually with --ignored
-async fn smoke_hello() {
-    let harness = E2EHarness::new("epiphytic");
-    let fixture = Fixture::load(fixtures_dir().join("smoke-hello.yaml"))
-        .expect("failed to load fixture");
+fn create_harness() -> E2EHarness {
+    let delete_on_success = std::env::var("E2E_DELETE_ON_SUCCESS")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
 
-    let result = harness.run_fixture(&fixture).await;
+    let config = E2EConfig::new("epiphytic")
+        .with_delete_on_success(delete_on_success)
+        .with_delete_on_failure(true);
 
+    E2EHarness::with_config(config)
+}
+
+fn print_result(result: &improbability_drive::e2e::E2EResult) {
     println!("\n=== E2E Result ===");
     println!("Fixture: {}", result.fixture_name);
     println!("Spawn success: {}", result.spawn_success);
     println!("Passed: {}", result.passed);
+
+    if let Some(repo_name) = &result.repo_name {
+        println!("Repository: {}", repo_name);
+        if result.repo_deleted {
+            println!("  (deleted)");
+        } else {
+            println!("  (kept - https://github.com/{})", repo_name);
+        }
+    }
+
+    if let Some(spawn_result) = &result.spawn_result {
+        println!("Duration: {:?}", spawn_result.duration);
+        println!("Summary: {}", spawn_result.summary);
+        if !spawn_result.commits.is_empty() {
+            println!("Commits: {}", spawn_result.commits.len());
+        }
+    }
+
+    if let Some(plan_pr_url) = &result.plan_pr_url {
+        println!("Plan PR URL: {}", plan_pr_url);
+    }
+
     if let Some(pr_url) = &result.pr_url {
         println!("PR URL: {}", pr_url);
     }
+
     if let Some(validation) = &result.validation {
-        println!("Validation messages:");
+        println!("Validation:");
         for msg in &validation.messages {
             println!("  - {}", msg);
         }
     }
+
     if let Some(error) = &result.error {
         println!("Error: {}", error);
     }
+}
+
+#[tokio::test]
+#[ignore] // Run manually with --ignored
+async fn smoke_hello() {
+    let harness = create_harness();
+    let fixture = Fixture::load(fixtures_dir().join("smoke-hello.yaml"))
+        .expect("failed to load fixture");
+
+    let result = harness.run_fixture(&fixture).await;
+    print_result(&result);
 
     assert!(result.passed, "E2E test failed: {:?}", result.error);
 }
@@ -51,32 +93,12 @@ async fn smoke_hello() {
 #[tokio::test]
 #[ignore]
 async fn code_generation() {
-    let harness = E2EHarness::new("epiphytic");
+    let harness = create_harness();
     let fixture = Fixture::load(fixtures_dir().join("code-generation.yaml"))
         .expect("failed to load fixture");
 
     let result = harness.run_fixture(&fixture).await;
-
-    println!("\n=== E2E Result ===");
-    println!("Fixture: {}", result.fixture_name);
-    println!("Spawn success: {}", result.spawn_success);
-    println!("Passed: {}", result.passed);
-    if let Some(spawn_result) = &result.spawn_result {
-        println!("Duration: {:?}", spawn_result.duration);
-        println!("Summary: {}", spawn_result.summary);
-    }
-    if let Some(pr_url) = &result.pr_url {
-        println!("PR URL: {}", pr_url);
-    }
-    if let Some(validation) = &result.validation {
-        println!("Validation:");
-        for msg in &validation.messages {
-            println!("  - {}", msg);
-        }
-    }
-    if let Some(error) = &result.error {
-        println!("Error: {}", error);
-    }
+    print_result(&result);
 
     assert!(result.passed, "E2E test failed: {:?}", result.error);
 }
@@ -84,33 +106,12 @@ async fn code_generation() {
 #[tokio::test]
 #[ignore]
 async fn full_web_app() {
-    let harness = E2EHarness::new("epiphytic");
+    let harness = create_harness();
     let fixture = Fixture::load(fixtures_dir().join("full-web-app.yaml"))
         .expect("failed to load fixture");
 
     let result = harness.run_fixture(&fixture).await;
-
-    println!("\n=== E2E Result ===");
-    println!("Fixture: {}", result.fixture_name);
-    println!("Spawn success: {}", result.spawn_success);
-    println!("Passed: {}", result.passed);
-    if let Some(spawn_result) = &result.spawn_result {
-        println!("Duration: {:?}", spawn_result.duration);
-        println!("Summary: {}", spawn_result.summary);
-        println!("Commits: {}", spawn_result.commits.len());
-    }
-    if let Some(pr_url) = &result.pr_url {
-        println!("PR URL: {}", pr_url);
-    }
-    if let Some(validation) = &result.validation {
-        println!("Validation:");
-        for msg in &validation.messages {
-            println!("  - {}", msg);
-        }
-    }
-    if let Some(error) = &result.error {
-        println!("Error: {}", error);
-    }
+    print_result(&result);
 
     assert!(result.passed, "E2E test failed: {:?}", result.error);
 }
@@ -119,7 +120,7 @@ async fn full_web_app() {
 #[tokio::test]
 #[ignore]
 async fn smoke_hello_gemini() {
-    let harness = E2EHarness::new("epiphytic");
+    let harness = create_harness();
 
     // Load and modify fixture for Gemini
     let yaml = std::fs::read_to_string(fixtures_dir().join("smoke-hello.yaml"))
@@ -128,11 +129,32 @@ async fn smoke_hello_gemini() {
     let fixture: Fixture = serde_yaml::from_str(&yaml).expect("failed to parse");
 
     let result = harness.run_fixture(&fixture).await;
+    print_result(&result);
 
-    println!("\n=== E2E Result (Gemini) ===");
-    println!("Passed: {}", result.passed);
-    if let Some(pr_url) = &result.pr_url {
-        println!("PR URL: {}", pr_url);
+    assert!(result.passed, "E2E test failed: {:?}", result.error);
+}
+
+/// Test the full workflow: plan -> approve -> execute.
+#[tokio::test]
+#[ignore]
+async fn full_workflow_simple() {
+    let harness = create_harness();
+    let fixture = Fixture::load(fixtures_dir().join("full-workflow-simple.yaml"))
+        .expect("failed to load fixture");
+
+    let result = harness.run_fixture(&fixture).await;
+    print_result(&result);
+
+    // For full workflow, we expect both plan PR and implementation PR
+    if result.passed {
+        assert!(
+            result.plan_pr_url.is_some(),
+            "Full workflow should create a plan PR"
+        );
+        assert!(
+            result.pr_url.is_some(),
+            "Full workflow should create an implementation PR"
+        );
     }
 
     assert!(result.passed, "E2E test failed: {:?}", result.error);
