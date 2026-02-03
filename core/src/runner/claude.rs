@@ -63,7 +63,8 @@ impl ClaudeRunner {
             args.push(config.manifest.allowed_tools.join(","));
         }
 
-        // Add the prompt
+        // Add the prompt via -p flag (required for --print mode)
+        args.push("-p".to_string());
         args.push(config.prompt.clone());
 
         args

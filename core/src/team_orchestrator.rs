@@ -781,10 +781,11 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Run the LLM directly using Command instead of spawning a new sandbox
         // Use --print with --verbose for stream-json output format
+        // IMPORTANT: -p flag is required for --print mode
         let output = std::process::Command::new("claude")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
-            .args(["--print", "--verbose", "--output-format", "stream-json", prompt])
+            .args(["--print", "--verbose", "--output-format", "stream-json", "-p", prompt])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run claude: {}", e)))?;
 
@@ -879,10 +880,15 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         // Run Gemini directly (not through spawner - it's a reviewer, not making changes)
+        // Use --print for non-interactive mode with --allowed-tools for Read access
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
-            .args(["--print", &review_prompt])
+            .args([
+                "--print",
+                "--allowed-tools", "Read,Glob,Grep",  // Read-only tools for review
+                "--prompt", &review_prompt,
+            ])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
 
@@ -1385,11 +1391,13 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Run Gemini with proper CLI arguments to execute the review
         // Using --approval-mode plan for safe execution with auto-approved plans
+        // Include Bash in --allowed-tools for `gh pr comment` access
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
             .args([
                 "--approval-mode", "plan",   // Auto-approve planned actions
+                "--allowed-tools", "Read,Glob,Grep,Bash",  // Need Bash for gh pr comment
                 "--prompt", &review_prompt,  // The review instructions
             ])
             .output()
@@ -1638,6 +1646,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         // Run Claude to resolve the comment
+        // IMPORTANT: -p flag is required for --print mode
         let output = Command::new("claude")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
@@ -1646,6 +1655,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 "--verbose",
                 "--output-format",
                 "stream-json",
+                "-p",
                 &resolve_prompt,
             ])
             .output()

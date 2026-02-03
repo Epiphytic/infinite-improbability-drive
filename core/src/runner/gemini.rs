@@ -56,6 +56,12 @@ impl GeminiRunner {
             args.push(model.clone());
         }
 
+        // Add allowed tools from manifest (required for GitHub access, etc.)
+        if !config.manifest.allowed_tools.is_empty() {
+            args.push("--allowed-tools".to_string());
+            args.push(config.manifest.allowed_tools.join(","));
+        }
+
         // Add the prompt using --prompt flag
         args.push("--prompt".to_string());
         args.push(config.prompt.clone());
