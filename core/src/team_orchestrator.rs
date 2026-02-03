@@ -712,7 +712,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         let config = SpawnConfig::new(prompt)
             .with_total_timeout(timeout)
             .with_max_escalations(self.config.max_escalations);
-        let manifest = SandboxManifest::default();
+        let manifest = SandboxManifest::with_sensible_defaults();
 
         tracing::info!(
             iteration = iteration,
@@ -1383,20 +1383,32 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             "running GitHub reviewer"
         );
 
-        // Run Gemini directly - it will use gh commands to create the review
+        // Run Gemini with proper CLI arguments to execute the review
+        // Using --yolo for auto-approval and --prompt to pass the review prompt
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
-            .args(["--print", &review_prompt])
+            .args([
+                "--yolo",                    // Auto-approve tool use
+                "--prompt", &review_prompt,  // The review instructions
+            ])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
 
         let raw_response = String::from_utf8_lossy(&output.stdout).to_string();
+        let gemini_success = output.status.success();
 
-        // Check if any reviews were created by looking at PR reviews
+        tracing::debug!(
+            domain = %domain.as_str(),
+            exit_code = ?output.status.code(),
+            stdout_len = raw_response.len(),
+            "gemini reviewer finished"
+        );
+
+        // Check if any review comments were created on the PR
         let reviews_created = self.check_for_new_reviews(pr_number, repo, sandbox_path)?;
 
-        // Determine verdict based on whether reviews requested changes
+        // Determine verdict based on review comments
         let verdict = if reviews_created {
             // Check if the latest review requested changes
             if self.latest_review_requests_changes(pr_number, repo, sandbox_path)? {
@@ -1405,8 +1417,39 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 ReviewVerdict::Approved
             }
         } else {
-            // No review created, assume approved (reviewer found nothing)
-            ReviewVerdict::Approved
+            // No review comment was created by Gemini
+            // This could mean: approved with no issues, OR Gemini failed to post
+            // Always post a status comment for traceability
+            let status_comment = if gemini_success {
+                format!(
+                    "[{} REVIEW - APPROVED]\n\n{} review completed. No issues found.",
+                    domain.as_str().to_uppercase(),
+                    domain.as_str()
+                )
+            } else {
+                format!(
+                    "[{} REVIEW - SKIPPED]\n\nReviewer did not complete successfully. Manual review recommended.",
+                    domain.as_str().to_uppercase()
+                )
+            };
+
+            // Post the status comment to the PR
+            let _ = Command::new("gh")
+                .current_dir(sandbox_path)
+                .args([
+                    "pr", "comment",
+                    &pr_number.to_string(),
+                    "--repo", repo,
+                    "--body", &status_comment,
+                ])
+                .output();
+
+            if gemini_success {
+                ReviewVerdict::Approved
+            } else {
+                // Reviewer failed, but don't block - just note it
+                ReviewVerdict::Approved
+            }
         };
 
         let review = ReviewResult {

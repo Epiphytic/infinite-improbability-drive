@@ -211,7 +211,7 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         let config = SpawnConfig::new(prompt)
             .with_total_timeout(timeout)
             .with_max_escalations(self.max_escalations);
-        let manifest = SandboxManifest::default();
+        let manifest = SandboxManifest::with_sensible_defaults();
         let runner = runner_type.create_runner();
 
         let spawn_result = spawner.spawn(config, manifest, runner).await?;
@@ -731,7 +731,7 @@ You must implement the following task. There is a detailed plan available in the
         let config = SpawnConfig::new(planning_prompt)
             .with_total_timeout(timeout)
             .with_max_escalations(self.max_escalations);
-        let manifest = SandboxManifest::default();
+        let manifest = SandboxManifest::with_sensible_defaults();
         let runner = ClaudeRunner::new();
 
         let spawn_result = spawner.spawn_with_branch(config, manifest, Box::new(runner), Some(&branch_name)).await?;
@@ -1210,7 +1210,7 @@ You must implement the following task. There is a detailed plan available in the
         let config = SpawnConfig::new(prompt)
             .with_total_timeout(timeout)
             .with_max_escalations(self.max_escalations);
-        let manifest = SandboxManifest::default();
+        let manifest = SandboxManifest::with_sensible_defaults();
         let runner = ClaudeRunner::new();
 
         let spawn_result = spawner.spawn_with_branch(config, manifest, Box::new(runner), Some(&branch_name)).await?;

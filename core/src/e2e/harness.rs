@@ -170,7 +170,7 @@ impl E2EHarness {
             .with_total_timeout(Duration::from_secs(fixture.timeout))
             .with_max_escalations(5);
 
-        let manifest = crate::SandboxManifest::default();
+        let manifest = crate::SandboxManifest::with_sensible_defaults();
 
         // Run spawn
         let spawn_result = match spawner.spawn(config, manifest, runner).await {
@@ -525,7 +525,7 @@ impl E2EHarness {
             .with_total_timeout(Duration::from_secs(timeout))
             .with_max_escalations(5);
 
-        let manifest = crate::SandboxManifest::default();
+        let manifest = crate::SandboxManifest::with_sensible_defaults();
 
         tracing::info!(phase = %phase_name, "running phase");
 
