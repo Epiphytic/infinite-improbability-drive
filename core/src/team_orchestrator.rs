@@ -12,8 +12,9 @@ use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::{SandboxManifest, SandboxProvider};
 use crate::spawn::{SpawnConfig, SpawnResult, SpawnStatus, Spawner};
 use crate::team::{
-    parse_review_response, CoordinationMode, FixPromptBuilder, ReviewPromptBuilder, ReviewResult,
-    ReviewVerdict, SpawnTeamConfig, SpawnTeamResult,
+    parse_review_response, CoordinationMode, FixPromptBuilder, GitHubReview, GitHubReviewComment,
+    GitHubReviewPromptBuilder, ResolveCommentPromptBuilder, ReviewDomain, ReviewPromptBuilder,
+    ReviewResult, ReviewVerdict, SpawnTeamConfig, SpawnTeamResult,
 };
 
 /// Observability data captured during spawn-team execution.
@@ -33,6 +34,25 @@ pub struct SpawnObservability {
     pub sandbox_path: Option<PathBuf>,
     /// Commits made during execution.
     pub commits: Vec<CommitRecord>,
+    /// GitHub PR URL (for GitHub mode).
+    pub pr_url: Option<String>,
+    /// GitHub reviews created during execution.
+    pub github_reviews: Vec<GitHubReview>,
+    /// GitHub review comments resolved.
+    pub resolved_comments: Vec<ResolvedCommentRecord>,
+}
+
+/// Record of a resolved GitHub review comment.
+#[derive(Debug, Clone)]
+pub struct ResolvedCommentRecord {
+    /// The comment ID.
+    pub comment_id: u64,
+    /// The commit that resolved the comment.
+    pub resolved_by_commit: String,
+    /// Timestamp of resolution.
+    pub resolved_at: String,
+    /// Brief explanation of the fix.
+    pub explanation: String,
 }
 
 /// Record of a command line invocation.
@@ -225,14 +245,37 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 let total_phases = 5; // Security, TechnicalFeasibility, TaskGranularity, DependencyCompleteness, GeneralPolish
                 let phases_to_run = total_phases.min(self.config.max_iterations);
 
+                // Track the sandbox path from the first iteration to reuse for subsequent iterations
+                let mut active_sandbox_path: Option<PathBuf> = None;
+
                 for i in 1..=phases_to_run {
                     iterations = i;
 
                     // Run primary (or fix if not first iteration)
-                    // All iterations use the same branch for consistency
-                    let primary_result = self
-                        .run_primary(&current_prompt, timeout, sandbox_path, i, branch_name)
-                        .await?;
+                    // First iteration: create sandbox with branch name
+                    // Subsequent iterations: reuse the existing sandbox
+                    let primary_result = if i == 1 {
+                        // First iteration - create the sandbox with the branch
+                        let result = self
+                            .run_primary(&current_prompt, timeout, sandbox_path, i, branch_name)
+                            .await?;
+                        // Capture the sandbox path for reuse
+                        if let Some(ref path) = result.sandbox_path {
+                            active_sandbox_path = Some(path.clone());
+                        }
+                        result
+                    } else {
+                        // Subsequent iterations - run on the existing sandbox
+                        // Pass None for branch_name to use the existing worktree
+                        if let Some(ref existing_sandbox) = active_sandbox_path {
+                            self.run_primary_on_existing_sandbox(&current_prompt, timeout, existing_sandbox, i)
+                                .await?
+                        } else {
+                            // Fallback: create new sandbox if we lost track (shouldn't happen)
+                            self.run_primary(&current_prompt, timeout, sandbox_path, i, None)
+                                .await?
+                        }
+                    };
 
                     if primary_result.status != SpawnStatus::Success {
                         return Ok(SpawnTeamResult {
@@ -247,8 +290,15 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                         });
                     }
 
-                    // Get diff for review
-                    let diff = self.get_git_diff(sandbox_path)?;
+                    // Update active sandbox path if it changed
+                    if let Some(ref path) = primary_result.sandbox_path {
+                        active_sandbox_path = Some(path.clone());
+                    }
+
+                    // Get diff for review - use the active sandbox path
+                    let default_path = sandbox_path.to_path_buf();
+                    let diff_sandbox = active_sandbox_path.as_ref().unwrap_or(&default_path);
+                    let diff = self.get_git_diff(diff_sandbox)?;
 
                     // Determine review phase based on iteration
                     let phase = self.get_review_phase(i);
@@ -296,6 +346,131 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                         );
                     }
                 }
+            }
+
+            CoordinationMode::GitHub => {
+                // GitHub-based workflow:
+                // 1. Primary creates initial implementation
+                // 2. Create PR on first commit
+                // 3. Reviewers create GitHub reviews with line comments
+                // 4. Coder resolves each comment with commits
+                // 5. All domains reviewed in sequence
+
+                let repo = self.get_repo_name(sandbox_path)?;
+
+                // Track the sandbox path from the first iteration
+                let mut active_sandbox_path: Option<PathBuf> = None;
+
+                // Step 1: Run primary to create initial implementation
+                tracing::info!("GitHub mode: running primary LLM for initial implementation");
+                let primary_result = self
+                    .run_primary(prompt, timeout, sandbox_path, 1, branch_name)
+                    .await?;
+
+                if primary_result.status != SpawnStatus::Success {
+                    return Ok(SpawnTeamResult {
+                        success: false,
+                        iterations: 1,
+                        final_verdict: None,
+                        reviews,
+                        summary: format!("Primary LLM failed: {}", primary_result.summary),
+                    });
+                }
+
+                // Capture sandbox path
+                if let Some(ref path) = primary_result.sandbox_path {
+                    active_sandbox_path = Some(path.clone());
+                }
+
+                let default_path = sandbox_path.to_path_buf();
+                let work_sandbox = active_sandbox_path.as_ref().unwrap_or(&default_path);
+
+                // Step 2: Create PR on first commit
+                let pr_url = self.create_pr_on_first_commit(work_sandbox, prompt, &repo)?;
+                self.observability.pr_url = Some(pr_url.clone());
+
+                // Extract PR number from URL
+                let pr_number = self.extract_pr_number(&pr_url)?;
+
+                tracing::info!(
+                    pr_url = %pr_url,
+                    pr_number = pr_number,
+                    "GitHub mode: created PR on first commit"
+                );
+
+                // Step 3: Run each review domain
+                for domain in ReviewDomain::all() {
+                    iterations += 1;
+
+                    tracing::info!(
+                        domain = %domain.as_str(),
+                        iteration = iterations,
+                        "GitHub mode: starting review domain"
+                    );
+
+                    // Get current diff for this domain
+                    let diff = self.get_git_diff(work_sandbox)?;
+
+                    // Run reviewer for this domain - creates GitHub review
+                    let review = self
+                        .run_github_reviewer(
+                            prompt,
+                            &diff,
+                            timeout,
+                            work_sandbox,
+                            *domain,
+                            pr_number,
+                            &repo,
+                        )
+                        .await?;
+
+                    reviews.push(review.clone());
+                    final_verdict = Some(review.verdict.clone());
+
+                    // If review requested changes, resolve comments
+                    if review.verdict == ReviewVerdict::NeedsChanges {
+                        // Get pending comments from the PR
+                        let pending_comments =
+                            self.get_pending_review_comments(pr_number, &repo, work_sandbox)?;
+
+                        // Resolve each comment
+                        for comment in pending_comments {
+                            tracing::info!(
+                                comment_id = comment.id,
+                                path = %comment.path,
+                                "GitHub mode: resolving review comment"
+                            );
+
+                            self.resolve_github_comment(
+                                prompt,
+                                timeout,
+                                work_sandbox,
+                                pr_number,
+                                &repo,
+                                comment,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+
+                // Final success is determined by the last review phase
+                let success = final_verdict
+                    .as_ref()
+                    .map(|v| *v == ReviewVerdict::Approved)
+                    .unwrap_or(false);
+
+                return Ok(SpawnTeamResult {
+                    success,
+                    iterations,
+                    final_verdict,
+                    reviews,
+                    summary: format!(
+                        "GitHub workflow completed. PR: {}. {} domains reviewed.",
+                        pr_url,
+                        ReviewDomain::all().len()
+                    ),
+                });
             }
         }
 
@@ -397,6 +572,90 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         }
 
         Ok(result)
+    }
+
+    /// Runs the primary LLM on an existing sandbox (for subsequent iterations).
+    ///
+    /// This avoids creating a new worktree and reuses the existing sandbox
+    /// from the first iteration.
+    async fn run_primary_on_existing_sandbox(
+        &mut self,
+        prompt: &str,
+        timeout: Duration,
+        sandbox_path: &Path,
+        iteration: u32,
+    ) -> Result<SpawnResult> {
+        let runner = ClaudeRunner::new();
+
+        // Record command line
+        let command = format!(
+            "{} --print --output-format stream-json \"{}\"",
+            runner.name(),
+            prompt.chars().take(50).collect::<String>()
+        );
+        self.observability.command_lines.push(CommandLineRecord {
+            llm: self.config.primary_llm.clone(),
+            command,
+            work_dir: sandbox_path.to_path_buf(),
+            iteration,
+            role: "primary".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        });
+
+        tracing::info!(
+            iteration = iteration,
+            llm = %self.config.primary_llm,
+            sandbox_path = ?sandbox_path,
+            "running primary LLM on existing sandbox"
+        );
+
+        // Run the LLM directly using Command instead of spawning a new sandbox
+        // Use --print with --verbose for stream-json output format
+        let output = std::process::Command::new("claude")
+            .current_dir(sandbox_path)
+            .args(["--print", "--verbose", "--output-format", "stream-json", prompt])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to run claude: {}", e)))?;
+
+        let success = output.status.success();
+        let summary = if success {
+            "LLM completed successfully".to_string()
+        } else {
+            format!(
+                "LLM failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        };
+
+        // Commit and push changes after LLM run for observability
+        if success {
+            self.commit_and_push_changes(
+                sandbox_path,
+                iteration,
+                &self.config.primary_llm.clone(),
+                None,
+            );
+        }
+
+        Ok(SpawnResult {
+            status: if success {
+                SpawnStatus::Success
+            } else {
+                SpawnStatus::Failed
+            },
+            spawn_id: format!("existing-sandbox-iter-{}", iteration),
+            duration: timeout, // We don't track actual duration here
+            files_changed: vec![],
+            commits: vec![],
+            summary,
+            pr_url: None,
+            logs: crate::spawn::SpawnLogs {
+                stdout: sandbox_path.join("stdout.log"),
+                stderr: sandbox_path.join("stderr.log"),
+                events: sandbox_path.join("events.jsonl"),
+            },
+            sandbox_path: Some(sandbox_path.to_path_buf()),
+        })
     }
 
     /// Runs the reviewer LLM (Gemini).
@@ -721,6 +980,451 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 }
             }
         }
+    }
+
+    // =========================================================================
+    // GitHub Mode Helper Methods
+    // =========================================================================
+
+    /// Gets the repository name from the sandbox path (e.g., "owner/repo").
+    fn get_repo_name(&self, sandbox_path: &Path) -> Result<String> {
+        let output = Command::new("gh")
+            .current_dir(sandbox_path)
+            .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to get repo name: {}", e)))?;
+
+        if !output.status.success() {
+            return Err(Error::Cruise(format!(
+                "gh repo view failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Creates a PR on the first commit to the branch.
+    fn create_pr_on_first_commit(
+        &self,
+        sandbox_path: &Path,
+        prompt: &str,
+        repo: &str,
+    ) -> Result<String> {
+        // Get current branch
+        let branch_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .map_err(|e| Error::Git(format!("failed to get branch: {}", e)))?;
+
+        let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+
+        // Get default branch
+        let default_branch = self.get_default_branch(sandbox_path)?;
+
+        // Push the branch first
+        let push_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["push", "-u", "origin", &branch])
+            .output()
+            .map_err(|e| Error::Git(format!("failed to push branch: {}", e)))?;
+
+        if !push_output.status.success() {
+            tracing::warn!(
+                error = %String::from_utf8_lossy(&push_output.stderr),
+                "failed to push branch, may already be pushed"
+            );
+        }
+
+        // Create PR title from prompt (truncate if needed)
+        let title: String = prompt.chars().take(70).collect();
+        let title = if prompt.len() > 70 {
+            format!("{}...", title)
+        } else {
+            title
+        };
+
+        // Create PR body with accordion for prompt
+        let body = format!(
+            "## Summary\n\n\
+             Initial implementation created by cruise-control.\n\n\
+             <details>\n\
+             <summary>Original Prompt</summary>\n\n\
+             {}\n\n\
+             </details>\n\n\
+             ---\n\
+             *This PR will be updated as reviews are addressed.*\n",
+            prompt
+        );
+
+        // Create the PR using gh CLI
+        let pr_output = Command::new("gh")
+            .current_dir(sandbox_path)
+            .args([
+                "pr",
+                "create",
+                "--repo",
+                repo,
+                "--title",
+                &title,
+                "--body",
+                &body,
+                "--base",
+                &default_branch,
+                "--head",
+                &branch,
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to create PR: {}", e)))?;
+
+        if !pr_output.status.success() {
+            return Err(Error::Cruise(format!(
+                "gh pr create failed: {}",
+                String::from_utf8_lossy(&pr_output.stderr)
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&pr_output.stdout).trim().to_string())
+    }
+
+    /// Gets the default branch of the repository.
+    fn get_default_branch(&self, sandbox_path: &Path) -> Result<String> {
+        let output = Command::new("gh")
+            .current_dir(sandbox_path)
+            .args([
+                "repo",
+                "view",
+                "--json",
+                "defaultBranchRef",
+                "-q",
+                ".defaultBranchRef.name",
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to get default branch: {}", e)))?;
+
+        if !output.status.success() {
+            // Fallback to main
+            return Ok("main".to_string());
+        }
+
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch.is_empty() {
+            Ok("main".to_string())
+        } else {
+            Ok(branch)
+        }
+    }
+
+    /// Extracts the PR number from a PR URL.
+    fn extract_pr_number(&self, pr_url: &str) -> Result<u64> {
+        // URL format: https://github.com/owner/repo/pull/123
+        pr_url
+            .split('/')
+            .last()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| Error::Cruise(format!("failed to extract PR number from: {}", pr_url)))
+    }
+
+    /// Runs the GitHub reviewer for a specific domain.
+    ///
+    /// The reviewer uses `gh pr review` to create a GitHub review with line comments.
+    async fn run_github_reviewer(
+        &mut self,
+        original_prompt: &str,
+        diff: &str,
+        _timeout: Duration,
+        sandbox_path: &Path,
+        domain: ReviewDomain,
+        pr_number: u64,
+        repo: &str,
+    ) -> Result<ReviewResult> {
+        let runner = GeminiRunner::new();
+
+        // Build GitHub review prompt
+        let review_prompt = GitHubReviewPromptBuilder::new(pr_number, repo, domain)
+            .with_original_prompt(original_prompt)
+            .with_diff(diff)
+            .build();
+
+        // Record command line
+        let command = format!(
+            "{} --print \"GitHub review for {} domain\"",
+            runner.name(),
+            domain.as_str()
+        );
+        self.observability.command_lines.push(CommandLineRecord {
+            llm: self.config.reviewer_llm.clone(),
+            command,
+            work_dir: sandbox_path.to_path_buf(),
+            iteration: 0, // GitHub mode uses domain instead of iteration
+            role: format!("reviewer-{}", domain.as_str().to_lowercase()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        });
+
+        tracing::info!(
+            domain = %domain.as_str(),
+            pr_number = pr_number,
+            llm = %self.config.reviewer_llm,
+            "running GitHub reviewer"
+        );
+
+        // Run Gemini directly - it will use gh commands to create the review
+        let output = Command::new("gemini")
+            .current_dir(sandbox_path)
+            .args(["--print", &review_prompt])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
+
+        let raw_response = String::from_utf8_lossy(&output.stdout).to_string();
+
+        // Check if any reviews were created by looking at PR reviews
+        let reviews_created = self.check_for_new_reviews(pr_number, repo, sandbox_path)?;
+
+        // Determine verdict based on whether reviews requested changes
+        let verdict = if reviews_created {
+            // Check if the latest review requested changes
+            if self.latest_review_requests_changes(pr_number, repo, sandbox_path)? {
+                ReviewVerdict::NeedsChanges
+            } else {
+                ReviewVerdict::Approved
+            }
+        } else {
+            // No review created, assume approved (reviewer found nothing)
+            ReviewVerdict::Approved
+        };
+
+        let review = ReviewResult {
+            verdict: verdict.clone(),
+            suggestions: vec![], // Suggestions are in GitHub comments
+            summary: format!("{} review completed", domain.as_str()),
+        };
+
+        // Record feedback
+        self.observability
+            .review_feedback
+            .push(ReviewFeedbackRecord {
+                iteration: 0,
+                phase: Some(domain.as_str().to_string()),
+                verdict: review.verdict.clone(),
+                suggestion_count: 0, // Comments are on GitHub
+                review: review.clone(),
+                raw_response: raw_response.clone(),
+                diff_reviewed: diff.to_string(),
+            });
+
+        // Extract security findings if this is a security review
+        if domain == ReviewDomain::Security {
+            self.extract_security_findings(&raw_response);
+        }
+
+        tracing::info!(
+            domain = %domain.as_str(),
+            verdict = ?review.verdict,
+            "GitHub reviewer completed"
+        );
+
+        Ok(review)
+    }
+
+    /// Checks if new reviews were created on the PR.
+    fn check_for_new_reviews(
+        &self,
+        pr_number: u64,
+        _repo: &str,
+        sandbox_path: &Path,
+    ) -> Result<bool> {
+        let output = Command::new("gh")
+            .current_dir(sandbox_path)
+            .args([
+                "pr",
+                "view",
+                &pr_number.to_string(),
+                "--json",
+                "reviews",
+                "-q",
+                ".reviews | length",
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to check reviews: {}", e)))?;
+
+        let count: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        Ok(count > 0)
+    }
+
+    /// Checks if the latest review requested changes.
+    fn latest_review_requests_changes(
+        &self,
+        pr_number: u64,
+        _repo: &str,
+        sandbox_path: &Path,
+    ) -> Result<bool> {
+        let output = Command::new("gh")
+            .current_dir(sandbox_path)
+            .args([
+                "pr",
+                "view",
+                &pr_number.to_string(),
+                "--json",
+                "reviews",
+                "-q",
+                ".reviews[-1].state",
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to check review state: {}", e)))?;
+
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(state == "CHANGES_REQUESTED")
+    }
+
+    /// Gets pending (unresolved) review comments from a PR.
+    fn get_pending_review_comments(
+        &self,
+        pr_number: u64,
+        _repo: &str,
+        sandbox_path: &Path,
+    ) -> Result<Vec<GitHubReviewComment>> {
+        let output = Command::new("gh")
+            .current_dir(sandbox_path)
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/pulls/{}/comments", pr_number),
+                "--jq",
+                r#".[] | select(.position != null) | {id: .id, path: .path, line: .line, body: .body}"#,
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to get PR comments: {}", e)))?;
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let mut comments = Vec::new();
+
+        // Parse JSONL output (one JSON object per line)
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                let id = parsed.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let path = parsed
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line_num = parsed.get("line").and_then(|v| v.as_u64()).map(|l| l as u32);
+                let body = parsed
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if id > 0 && !path.is_empty() {
+                    comments.push(GitHubReviewComment {
+                        id,
+                        path,
+                        line: line_num,
+                        body,
+                        resolved: false,
+                        resolved_by_commit: None,
+                    });
+                }
+            }
+        }
+
+        Ok(comments)
+    }
+
+    /// Resolves a GitHub review comment by having the coder address it.
+    async fn resolve_github_comment(
+        &mut self,
+        original_prompt: &str,
+        _timeout: Duration,
+        sandbox_path: &Path,
+        pr_number: u64,
+        repo: &str,
+        comment: GitHubReviewComment,
+    ) -> Result<()> {
+        let comment_id = comment.id;
+
+        // Build prompt for coder to resolve this comment
+        let resolve_prompt =
+            ResolveCommentPromptBuilder::new(pr_number, repo, comment.clone())
+                .with_original_prompt(original_prompt)
+                .build();
+
+        // Record command line
+        self.observability.command_lines.push(CommandLineRecord {
+            llm: self.config.primary_llm.clone(),
+            command: format!("claude --print \"resolve comment {}\"", comment_id),
+            work_dir: sandbox_path.to_path_buf(),
+            iteration: 0,
+            role: "resolver".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        });
+
+        tracing::info!(
+            comment_id = comment_id,
+            path = %comment.path,
+            "resolving GitHub review comment"
+        );
+
+        // Run Claude to resolve the comment
+        let output = Command::new("claude")
+            .current_dir(sandbox_path)
+            .args([
+                "--print",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                &resolve_prompt,
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to run claude: {}", e)))?;
+
+        if !output.status.success() {
+            tracing::warn!(
+                comment_id = comment_id,
+                error = %String::from_utf8_lossy(&output.stderr),
+                "failed to resolve comment"
+            );
+            return Ok(()); // Don't fail the whole workflow for one comment
+        }
+
+        // Commit and push changes
+        if let Some(commit_hash) = self.commit_and_push_changes(
+            sandbox_path,
+            0,
+            &self.config.primary_llm.clone(),
+            Some(&format!("resolving-comment-{}", comment_id)),
+        ) {
+            // Record resolution
+            self.observability
+                .resolved_comments
+                .push(ResolvedCommentRecord {
+                    comment_id,
+                    resolved_by_commit: commit_hash.clone(),
+                    resolved_at: chrono::Utc::now().to_rfc3339(),
+                    explanation: format!("Resolved in commit {}", commit_hash),
+                });
+
+            // Reply to the comment on GitHub
+            let reply_body = format!("Fixed in commit {}", commit_hash);
+            let _ = Command::new("gh")
+                .current_dir(sandbox_path)
+                .args([
+                    "pr",
+                    "comment",
+                    &pr_number.to_string(),
+                    "--body",
+                    &reply_body,
+                ])
+                .output();
+        }
+
+        Ok(())
     }
 }
 

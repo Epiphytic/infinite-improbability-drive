@@ -10,10 +10,16 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum CoordinationMode {
     /// Sequential mode: Primary runs, then reviewer reviews, then primary fixes.
-    #[default]
     Sequential,
     /// Ping-pong mode: Iterative back-and-forth until approved.
     PingPong,
+    /// GitHub mode (default): PR-based coordination with GitHub reviews.
+    /// - PR is created on first commit
+    /// - Reviewer LLMs create GitHub reviews with "request changes" and line comments
+    /// - Coder LLM resolves comments with commits
+    /// - Full traceability on the PR
+    #[default]
+    GitHub,
 }
 
 /// Configuration for spawn-team coordination.
@@ -90,6 +96,133 @@ pub struct ReviewResult {
     pub suggestions: Vec<ReviewSuggestion>,
     /// Summary of the review.
     pub summary: String,
+}
+
+/// A GitHub review comment with line-specific feedback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubReviewComment {
+    /// The GitHub comment ID.
+    pub id: u64,
+    /// File path the comment applies to.
+    pub path: String,
+    /// Line number in the diff.
+    pub line: Option<u32>,
+    /// The comment body.
+    pub body: String,
+    /// Whether the comment has been resolved.
+    pub resolved: bool,
+    /// Commit SHA that resolved this comment (if resolved).
+    pub resolved_by_commit: Option<String>,
+}
+
+/// A GitHub review with its state and comments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubReview {
+    /// The GitHub review ID.
+    pub id: u64,
+    /// Review state: CHANGES_REQUESTED, APPROVED, COMMENTED.
+    pub state: String,
+    /// Review domain (Security, TechnicalFeasibility, etc.).
+    pub domain: String,
+    /// Review body/summary.
+    pub body: String,
+    /// Line-specific comments in this review.
+    pub comments: Vec<GitHubReviewComment>,
+    /// Timestamp of the review.
+    pub submitted_at: String,
+}
+
+/// Domains for specialized review passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDomain {
+    /// Security review: auth, injection, OWASP top 10.
+    Security,
+    /// Technical feasibility: architecture, performance.
+    TechnicalFeasibility,
+    /// Task granularity: appropriate sizing for parallel execution.
+    TaskGranularity,
+    /// Dependency completeness: are all dependencies identified.
+    DependencyCompleteness,
+    /// General polish: code quality, documentation.
+    GeneralPolish,
+}
+
+impl ReviewDomain {
+    /// Returns all review domains in order.
+    pub fn all() -> &'static [ReviewDomain] {
+        &[
+            ReviewDomain::Security,
+            ReviewDomain::TechnicalFeasibility,
+            ReviewDomain::TaskGranularity,
+            ReviewDomain::DependencyCompleteness,
+            ReviewDomain::GeneralPolish,
+        ]
+    }
+
+    /// Returns the domain name as a string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewDomain::Security => "Security",
+            ReviewDomain::TechnicalFeasibility => "TechnicalFeasibility",
+            ReviewDomain::TaskGranularity => "TaskGranularity",
+            ReviewDomain::DependencyCompleteness => "DependencyCompleteness",
+            ReviewDomain::GeneralPolish => "GeneralPolish",
+        }
+    }
+
+    /// Returns instructions for the reviewer for this domain.
+    pub fn instructions(&self) -> &'static str {
+        match self {
+            ReviewDomain::Security => {
+                "You are reviewing for SECURITY issues ONLY. Focus on:\n\
+                 - Authentication and authorization flaws\n\
+                 - Input validation and sanitization\n\
+                 - Injection vulnerabilities (SQL, command, XSS)\n\
+                 - Secrets/credentials exposure\n\
+                 - OWASP Top 10 vulnerabilities\n\n\
+                 Create a GitHub review with 'request changes' if you find issues.\n\
+                 Use line-specific comments for each issue found."
+            }
+            ReviewDomain::TechnicalFeasibility => {
+                "You are reviewing for TECHNICAL FEASIBILITY ONLY. Focus on:\n\
+                 - Is the architecture sound and appropriate?\n\
+                 - Are the right technologies/libraries being used?\n\
+                 - Are there performance concerns or scalability issues?\n\
+                 - Is error handling appropriate?\n\n\
+                 Create a GitHub review with 'request changes' if you find issues.\n\
+                 Use line-specific comments for each concern."
+            }
+            ReviewDomain::TaskGranularity => {
+                "You are reviewing for TASK GRANULARITY ONLY. Focus on:\n\
+                 - Are tasks appropriately sized for parallel execution?\n\
+                 - Should any large tasks be split?\n\
+                 - Should any small tasks be combined?\n\
+                 - Is the task breakdown clear and actionable?\n\n\
+                 Create a GitHub review with 'request changes' if you find issues.\n\
+                 Use line-specific comments for suggestions."
+            }
+            ReviewDomain::DependencyCompleteness => {
+                "You are reviewing for DEPENDENCY COMPLETENESS ONLY. Focus on:\n\
+                 - Are all task dependencies correctly identified?\n\
+                 - Are there missing dependencies that could cause issues?\n\
+                 - Are there opportunities for parallelization being missed?\n\
+                 - Is the dependency graph cycle-free and logical?\n\n\
+                 Create a GitHub review with 'request changes' if you find issues.\n\
+                 Use line-specific comments for missing dependencies."
+            }
+            ReviewDomain::GeneralPolish => {
+                "You are doing a FINAL POLISH review. Focus on:\n\
+                 - Code quality and readability\n\
+                 - Documentation completeness\n\
+                 - Test coverage adequacy\n\
+                 - Consistency with project conventions\n\
+                 - Did previous review fixes actually address the issues?\n\n\
+                 Create a GitHub review with 'request changes' if you find issues.\n\
+                 Use line-specific comments for polish suggestions."
+            }
+        }
+    }
 }
 
 /// Status of a spawn-team iteration.
@@ -224,6 +357,162 @@ impl FixPromptBuilder {
     }
 }
 
+/// Builder for creating GitHub review prompts.
+///
+/// This generates a prompt that instructs the reviewer to use `gh pr review`
+/// to create a GitHub review with line-specific comments.
+pub struct GitHubReviewPromptBuilder {
+    pr_number: u64,
+    repo: String,
+    domain: ReviewDomain,
+    original_prompt: String,
+    git_diff: String,
+}
+
+impl GitHubReviewPromptBuilder {
+    /// Creates a new GitHub review prompt builder.
+    pub fn new(pr_number: u64, repo: impl Into<String>, domain: ReviewDomain) -> Self {
+        Self {
+            pr_number,
+            repo: repo.into(),
+            domain,
+            original_prompt: String::new(),
+            git_diff: String::new(),
+        }
+    }
+
+    /// Sets the original task prompt.
+    pub fn with_original_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.original_prompt = prompt.into();
+        self
+    }
+
+    /// Sets the git diff to review.
+    pub fn with_diff(mut self, diff: impl Into<String>) -> Self {
+        self.git_diff = diff.into();
+        self
+    }
+
+    /// Builds the GitHub review prompt.
+    pub fn build(&self) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str(&format!(
+            "## GitHub Code Review: {} Domain\n\n",
+            self.domain.as_str()
+        ));
+
+        prompt.push_str(self.domain.instructions());
+        prompt.push_str("\n\n");
+
+        prompt.push_str("### Original Task\n\n");
+        prompt.push_str(&self.original_prompt);
+        prompt.push_str("\n\n");
+
+        prompt.push_str("### Changes to Review\n\n");
+        prompt.push_str("```diff\n");
+        prompt.push_str(&self.git_diff);
+        prompt.push_str("\n```\n\n");
+
+        prompt.push_str("### Instructions\n\n");
+        prompt.push_str("You MUST use the `gh` CLI to submit your review. Use this command:\n\n");
+        prompt.push_str("```bash\n");
+        prompt.push_str(&format!(
+            "gh pr review {} --repo {} --request-changes --body \"Your review summary\"\n",
+            self.pr_number, self.repo
+        ));
+        prompt.push_str("```\n\n");
+
+        prompt.push_str("For line-specific comments, use:\n\n");
+        prompt.push_str("```bash\n");
+        prompt.push_str(&format!(
+            "gh pr review {} --repo {} --comment --body \"Comment on specific line\" \\\n",
+            self.pr_number, self.repo
+        ));
+        prompt.push_str("  --path \"path/to/file\" --line 42\n");
+        prompt.push_str("```\n\n");
+
+        prompt.push_str("If the code passes this review domain with no issues, use:\n\n");
+        prompt.push_str("```bash\n");
+        prompt.push_str(&format!(
+            "gh pr review {} --repo {} --approve --body \"{} review passed\"\n",
+            self.pr_number,
+            self.repo,
+            self.domain.as_str()
+        ));
+        prompt.push_str("```\n\n");
+
+        prompt.push_str("IMPORTANT: You must ONLY create GitHub reviews using the `gh` command. ");
+        prompt.push_str("Do not make any other changes to the repository. ");
+        prompt.push_str(
+            "Your entire output should be the `gh` commands you run and their results.\n",
+        );
+
+        prompt
+    }
+}
+
+/// Builder for creating prompts to resolve GitHub review comments.
+///
+/// This generates a prompt that instructs the coder to resolve
+/// specific review comments with code changes.
+pub struct ResolveCommentPromptBuilder {
+    pr_number: u64,
+    repo: String,
+    comment: GitHubReviewComment,
+    original_prompt: String,
+}
+
+impl ResolveCommentPromptBuilder {
+    /// Creates a new resolve comment prompt builder.
+    pub fn new(pr_number: u64, repo: impl Into<String>, comment: GitHubReviewComment) -> Self {
+        Self {
+            pr_number,
+            repo: repo.into(),
+            comment,
+            original_prompt: String::new(),
+        }
+    }
+
+    /// Sets the original task prompt for context.
+    pub fn with_original_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.original_prompt = prompt.into();
+        self
+    }
+
+    /// Builds the resolve comment prompt.
+    pub fn build(&self) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str("## Resolve GitHub Review Comment\n\n");
+
+        prompt.push_str("### Original Task Context\n\n");
+        prompt.push_str(&self.original_prompt);
+        prompt.push_str("\n\n");
+
+        prompt.push_str("### Review Comment to Address\n\n");
+        prompt.push_str(&format!("**File:** `{}`\n", self.comment.path));
+        if let Some(line) = self.comment.line {
+            prompt.push_str(&format!("**Line:** {}\n", line));
+        }
+        prompt.push_str(&format!("**Comment ID:** {}\n\n", self.comment.id));
+        prompt.push_str(&format!("**Feedback:**\n{}\n\n", self.comment.body));
+
+        prompt.push_str("### Instructions\n\n");
+        prompt.push_str("1. Address the review comment by making the necessary code changes.\n");
+        prompt.push_str("2. Commit your changes with a message referencing the comment.\n");
+        prompt.push_str(&format!(
+            "3. After committing, reply to the comment using:\n   ```bash\n   gh pr comment {} --repo {} --body \"Fixed in commit <hash>: <brief explanation>\"\n   ```\n\n",
+            self.pr_number, self.repo
+        ));
+        prompt.push_str(
+            "If you believe the comment should NOT be addressed, explain why in a reply instead.\n",
+        );
+
+        prompt
+    }
+}
+
 /// Parses a review response from JSON.
 pub fn parse_review_response(response: &str) -> Option<ReviewResult> {
     // Try to find JSON in the response
@@ -270,15 +559,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coordination_mode_default_is_sequential() {
-        assert_eq!(CoordinationMode::default(), CoordinationMode::Sequential);
+    fn coordination_mode_default_is_github() {
+        assert_eq!(CoordinationMode::default(), CoordinationMode::GitHub);
     }
 
     #[test]
     fn spawn_team_config_has_sensible_defaults() {
         let config = SpawnTeamConfig::default();
 
-        assert_eq!(config.mode, CoordinationMode::Sequential);
+        assert_eq!(config.mode, CoordinationMode::GitHub);
         assert_eq!(config.max_iterations, 3);
         assert_eq!(config.primary_llm, "claude-code");
         assert_eq!(config.reviewer_llm, "gemini-cli");
@@ -293,6 +582,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CoordinationMode::PingPong).unwrap(),
             "\"pingpong\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CoordinationMode::GitHub).unwrap(),
+            "\"github\""
         );
     }
 
@@ -433,5 +726,101 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"iterations\":2"));
+    }
+
+    #[test]
+    fn review_domain_all_returns_five_domains() {
+        let domains = ReviewDomain::all();
+        assert_eq!(domains.len(), 5);
+        assert_eq!(domains[0], ReviewDomain::Security);
+        assert_eq!(domains[4], ReviewDomain::GeneralPolish);
+    }
+
+    #[test]
+    fn review_domain_as_str_works() {
+        assert_eq!(ReviewDomain::Security.as_str(), "Security");
+        assert_eq!(
+            ReviewDomain::TechnicalFeasibility.as_str(),
+            "TechnicalFeasibility"
+        );
+        assert_eq!(ReviewDomain::GeneralPolish.as_str(), "GeneralPolish");
+    }
+
+    #[test]
+    fn review_domain_instructions_not_empty() {
+        for domain in ReviewDomain::all() {
+            let instructions = domain.instructions();
+            assert!(!instructions.is_empty());
+            assert!(instructions.contains("GitHub review"));
+        }
+    }
+
+    #[test]
+    fn github_review_prompt_builder_creates_prompt() {
+        let prompt = GitHubReviewPromptBuilder::new(123, "owner/repo", ReviewDomain::Security)
+            .with_original_prompt("Fix the auth bug")
+            .with_diff("+ new code\n- old code")
+            .build();
+
+        assert!(prompt.contains("Security Domain"));
+        assert!(prompt.contains("Fix the auth bug"));
+        assert!(prompt.contains("+ new code"));
+        assert!(prompt.contains("gh pr review 123"));
+        assert!(prompt.contains("--repo owner/repo"));
+        assert!(prompt.contains("--request-changes"));
+    }
+
+    #[test]
+    fn resolve_comment_prompt_builder_creates_prompt() {
+        let comment = GitHubReviewComment {
+            id: 456,
+            path: "src/auth.rs".to_string(),
+            line: Some(42),
+            body: "Missing error handling".to_string(),
+            resolved: false,
+            resolved_by_commit: None,
+        };
+
+        let prompt = ResolveCommentPromptBuilder::new(123, "owner/repo", comment)
+            .with_original_prompt("Implement authentication")
+            .build();
+
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("Line:** 42"));
+        assert!(prompt.contains("456"));
+        assert!(prompt.contains("Missing error handling"));
+        assert!(prompt.contains("gh pr comment 123"));
+    }
+
+    #[test]
+    fn github_review_comment_serializes() {
+        let comment = GitHubReviewComment {
+            id: 123,
+            path: "src/main.rs".to_string(),
+            line: Some(10),
+            body: "Fix this".to_string(),
+            resolved: false,
+            resolved_by_commit: None,
+        };
+
+        let json = serde_json::to_string(&comment).unwrap();
+        assert!(json.contains("\"id\":123"));
+        assert!(json.contains("\"path\":\"src/main.rs\""));
+    }
+
+    #[test]
+    fn github_review_serializes() {
+        let review = GitHubReview {
+            id: 789,
+            state: "CHANGES_REQUESTED".to_string(),
+            domain: "Security".to_string(),
+            body: "Found issues".to_string(),
+            comments: vec![],
+            submitted_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let json = serde_json::to_string(&review).unwrap();
+        assert!(json.contains("\"id\":789"));
+        assert!(json.contains("CHANGES_REQUESTED"));
     }
 }
