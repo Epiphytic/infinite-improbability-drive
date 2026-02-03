@@ -1240,37 +1240,59 @@ You must implement the following task. There is a detailed plan available in the
     ) -> Option<String> {
         let pr_manager = PRManager::new(repo_path.clone());
 
-        // Commit changes
+        // Get the actual git branch name (not sandbox directory name which is sanitized)
+        let branch_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()?;
+
+        let branch_name = String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string();
+
+        if branch_name.is_empty() || branch_name == "HEAD" {
+            tracing::warn!("could not determine branch name from sandbox");
+            return None;
+        }
+
+        tracing::info!(branch = %branch_name, "creating implementation PR");
+
+        // Try to commit any remaining changes (orchestrator may have already committed)
         let commit_message = format!(
             "Implement: {}\n\nCompleted after {} iteration(s)",
             truncate_string(prompt, 50),
             iterations
         );
 
-        if pr_manager
-            .commit_changes(sandbox_path, &commit_message)
-            .ok()?
-            .is_none()
-        {
-            tracing::info!("no implementation changes to commit");
-            return None;
+        // Commit is optional - orchestrator may have already committed
+        let _ = pr_manager.commit_changes(sandbox_path, &commit_message);
+
+        // Push branch (may already be pushed, but ensure it's up to date)
+        if pr_manager.push_branch(sandbox_path, &branch_name).is_err() {
+            tracing::warn!("push_branch failed, checking if branch exists remotely");
         }
 
-        // Get branch name
-        let branch_name = sandbox_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("implementation");
+        // Check if we have any commits on this branch relative to main
+        // If not, there's nothing to PR
+        let has_commits = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-list", "--count", &format!("main..{}", &branch_name)])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
 
-        // Push branch
-        if pr_manager.push_branch(sandbox_path, branch_name).is_err() {
+        if has_commits == 0 {
+            tracing::info!("no commits on branch relative to main, skipping PR creation");
             return None;
         }
 
         // Get commits and file changes for enhanced PR body
-        let commits = get_branch_commits(sandbox_path, branch_name, "main").unwrap_or_default();
+        let commits = get_branch_commits(sandbox_path, &branch_name, "main").unwrap_or_default();
         let files_changed =
-            get_file_changes(sandbox_path, branch_name, "main").unwrap_or_default();
+            get_file_changes(sandbox_path, &branch_name, "main").unwrap_or_default();
 
         // Generate enhanced PR body
         let mut pr_body = pr_manager.generate_enhanced_pr_body(
@@ -1290,7 +1312,7 @@ You must implement the following task. There is a detailed plan available in the
             .create_pr(
                 &format!("Implement: {}", truncate_string(prompt, 50)),
                 &pr_body,
-                branch_name,
+                &branch_name,
                 "main",
             )
             .ok()
