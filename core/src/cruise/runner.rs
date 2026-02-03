@@ -124,23 +124,45 @@ pub struct CruiseRunner<P: SandboxProvider + Clone> {
     auto_approve: bool,
     /// Use spawn-team ping-pong mode with Gemini reviews
     use_spawn_team: bool,
+    /// Team coordination mode (PingPong or GitHub)
+    team_mode: crate::team::CoordinationMode,
+    /// Environment variables to pass to LLM processes
+    env_vars: std::collections::HashMap<String, String>,
 }
 
 impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
     /// Creates a new CruiseRunner with the given sandbox provider.
     pub fn new(provider: P, logs_dir: PathBuf) -> Self {
+        // Default env vars include FORK_JOIN_DISABLED to avoid conflicts
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert("FORK_JOIN_DISABLED".to_string(), "1".to_string());
+
         Self {
             config: CruiseConfig::default(),
             provider,
             logs_dir,
             auto_approve: false,
             use_spawn_team: false,
+            team_mode: crate::team::CoordinationMode::default(),
+            env_vars,
         }
     }
 
     /// Enables spawn-team mode with Gemini reviews.
     pub fn with_spawn_team(mut self, enabled: bool) -> Self {
         self.use_spawn_team = enabled;
+        self
+    }
+
+    /// Sets the team coordination mode.
+    pub fn with_team_mode(mut self, mode: crate::team::CoordinationMode) -> Self {
+        self.team_mode = mode;
+        self
+    }
+
+    /// Adds environment variables to pass to LLM processes.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env_vars.insert(key.into(), value.into());
         self
     }
 
@@ -253,11 +275,52 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
 
                 // Pull the merged plan PR changes to local repo
                 // This ensures the execution sandbox includes the plan files
-                tracing::info!(repo_path = ?repo_path, "pulling merged plan changes");
-                let _ = Command::new("git")
+                tracing::info!(repo_path = ?repo_path, "pulling merged plan changes to local repo");
+
+                // First fetch to ensure we have latest refs
+                let fetch_output = Command::new("git")
                     .current_dir(repo_path)
-                    .args(["pull", "--rebase=false", "origin", "main"])
-                    .output();
+                    .args(["fetch", "origin", "main"])
+                    .output()
+                    .map_err(|e| Error::Git(format!("failed to fetch: {}", e)))?;
+
+                if !fetch_output.status.success() {
+                    tracing::warn!(
+                        error = %String::from_utf8_lossy(&fetch_output.stderr),
+                        "git fetch failed"
+                    );
+                }
+
+                // Reset to origin/main to ensure we have the merged changes
+                let reset_output = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["reset", "--hard", "origin/main"])
+                    .output()
+                    .map_err(|e| Error::Git(format!("failed to reset: {}", e)))?;
+
+                if !reset_output.status.success() {
+                    tracing::warn!(
+                        error = %String::from_utf8_lossy(&reset_output.stderr),
+                        "git reset failed"
+                    );
+                } else {
+                    tracing::info!("successfully synced local repo with merged plan");
+                }
+
+                // Verify the plan files exist
+                let plan_dir = repo_path.join("docs").join("plans");
+                if plan_dir.exists() {
+                    let plan_files: Vec<_> = std::fs::read_dir(&plan_dir)
+                        .map(|entries| entries.filter_map(|e| e.ok()).collect())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        plan_dir = ?plan_dir,
+                        plan_files = plan_files.len(),
+                        "verified plan files exist after sync"
+                    );
+                } else {
+                    tracing::warn!(plan_dir = ?plan_dir, "plan directory does not exist after sync");
+                }
             } else {
                 // In production, would poll for approval
                 tracing::info!(pr_url = %pr_url, "plan PR created, waiting for approval");
@@ -431,6 +494,54 @@ Task to plan (do NOT implement): {prompt}"#,
         )
     }
 
+    /// Creates an execution-specific prompt that references the plan.
+    ///
+    /// This tells the LLM to implement the plan, not create another plan.
+    fn create_execution_prompt(&self, original_prompt: &str, repo_path: &PathBuf) -> String {
+        // Find the plan file
+        let plans_dir = repo_path.join("docs").join("plans");
+        let plan_file = if plans_dir.exists() {
+            std::fs::read_dir(&plans_dir)
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
+                        .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
+                })
+                .map(|e| e.path())
+        } else {
+            None
+        };
+
+        let plan_reference = match plan_file {
+            Some(path) => format!(
+                "\n\n**IMPLEMENTATION PLAN:** Read and follow the plan at `{}`",
+                path.strip_prefix(repo_path).unwrap_or(&path).display()
+            ),
+            None => String::new(),
+        };
+
+        format!(
+            r#"**THIS IS THE IMPLEMENTATION PHASE. IMPLEMENT THE CODE NOW.**
+
+You must implement the following task. There is a detailed plan available in the repository.
+{}
+
+**CRITICAL INSTRUCTIONS:**
+1. Read the implementation plan in `docs/plans/` if it exists
+2. Create all necessary files: source code, configuration, tests
+3. Do NOT create another planning document - IMPLEMENT the actual code
+4. Start with the foundation (package/project setup) and work through the plan
+5. Create working code, not just stubs or placeholders
+6. Commit your changes frequently
+
+**Original Task:**
+{}"#,
+            plan_reference, original_prompt
+        )
+    }
+
     /// Runs the planning phase, creates beads issues, and creates a plan PR.
     ///
     /// When spawn-team is enabled, uses ping-pong mode with Gemini reviews.
@@ -487,7 +598,7 @@ Task to plan (do NOT implement): {prompt}"#,
 
         // Configure spawn-team for planning
         let team_config = SpawnTeamConfig {
-            mode: CoordinationMode::PingPong,
+            mode: self.team_mode,
             max_iterations: self.config.planning.ping_pong_iterations,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
@@ -539,24 +650,27 @@ Task to plan (do NOT implement): {prompt}"#,
             }
         }
 
-        // Create plan PR if successful
-        let pr_url = if team_result.success {
-            if let Some(ref sandbox) = sandbox_path {
-                // Include observability in the PR body
-                self.create_plan_pr_with_observability(
-                    sandbox,
-                    repo_path,
-                    original_prompt,
-                    parsed_plan.as_ref(),
-                    &observability,
-                    team_result.iterations,
-                )
+        // Get PR URL from observability (created on first commit by SpawnTeamOrchestrator)
+        // If not present (e.g., in Sequential mode), create one now
+        let pr_url = observability.pr_url.clone().or_else(|| {
+            if team_result.success {
+                if let Some(ref sandbox) = sandbox_path {
+                    // Include observability in the PR body
+                    self.create_plan_pr_with_observability(
+                        sandbox,
+                        repo_path,
+                        original_prompt,
+                        parsed_plan.as_ref(),
+                        &observability,
+                        team_result.iterations,
+                    )
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            None
-        };
+        });
 
         let plan_result = PlanResult {
             success: team_result.success,
@@ -965,7 +1079,7 @@ Task to plan (do NOT implement): {prompt}"#,
 
         // Configure spawn-team for execution
         let team_config = SpawnTeamConfig {
-            mode: CoordinationMode::PingPong,
+            mode: self.team_mode,
             max_iterations: self.config.planning.ping_pong_iterations, // Reuse planning iterations
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
@@ -977,8 +1091,11 @@ Task to plan (do NOT implement): {prompt}"#,
         )
         .with_config(team_config);
 
+        // Create an execution-specific prompt that references the plan
+        let execution_prompt = self.create_execution_prompt(prompt, repo_path);
+
         // Run the orchestrator with the explicit branch name
-        let team_result = orchestrator.run_with_branch(prompt, timeout, repo_path, Some(&branch_name)).await?;
+        let team_result = orchestrator.run_with_branch(&execution_prompt, timeout, repo_path, Some(&branch_name)).await?;
 
         // Get observability data from orchestrator
         let observability = orchestrator.take_observability();
