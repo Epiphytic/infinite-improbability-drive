@@ -25,6 +25,13 @@ prompt: |
      - Test logging into the app using a short-lived JWT token
      - Test adding and removing tables
      - Test changing table structure
+     - Push test results to the repository for validation on the PR
+
+  5. CI/CD
+     - Create GitHub Actions workflows for:
+       - Lint checks using Super-Linter (github/super-linter)
+       - Dependency review using dependency-review-action (https://github.com/actions/dependency-review-action)
+       - Run on all PRs
 
 validation:
   level: full
@@ -33,6 +40,8 @@ validation:
     - src/main.rs
     - src/lib.rs
     - static/index.html
+    - .github/workflows/lint.yml
+    - .github/workflows/dependency-review.yml
   build_command: cargo build --release
   test_command: cargo test --lib
   e2e_command: cargo test --test e2e

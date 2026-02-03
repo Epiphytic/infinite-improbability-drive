@@ -294,12 +294,30 @@ The PLAN.md file must contain:
 1. A header with the plan title
 2. An Overview section explaining the approach
 3. A Risk Areas section listing potential issues
-4. A JSON block with the tasks in this exact format:
+4. A JSON block with the tasks and spawn instances in this exact format:
 
 ```json
 {{
   "title": "Short plan title",
   "overview": "Brief overview",
+  "spawn_instances": [
+    {{
+      "id": "SPAWN-001",
+      "name": "Core Infrastructure Setup",
+      "use_spawn_team": true,
+      "cli_params": "claude --model sonnet --allowedTools Read,Write,Edit,Bash,Glob,Grep --timeout 300",
+      "permissions": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+      "task_ids": ["CRUISE-001", "CRUISE-002"]
+    }},
+    {{
+      "id": "SPAWN-002",
+      "name": "Frontend Implementation",
+      "use_spawn_team": false,
+      "cli_params": "claude --model haiku --allowedTools Read,Write,Edit --timeout 180",
+      "permissions": ["Read", "Write", "Edit"],
+      "task_ids": ["CRUISE-003"]
+    }}
+  ],
   "tasks": [
     {{
       "id": "CRUISE-001",
@@ -307,14 +325,37 @@ The PLAN.md file must contain:
       "description": "What needs to be done",
       "blocked_by": [],
       "complexity": "low|medium|high",
-      "acceptance_criteria": ["Criterion 1", "Criterion 2"]
+      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
+      "permissions": ["Read", "Write", "Edit", "Bash"],
+      "cli_params": "claude --model sonnet --allowedTools Read,Write,Edit,Bash",
+      "spawn_instance": "SPAWN-001"
     }}
   ],
   "risks": ["Risk 1", "Risk 2"]
 }}
 ```
 
-Use CRUISE-XXX IDs (e.g., CRUISE-001, CRUISE-002). List dependencies in blocked_by using task IDs.
+**SECURITY-CRITICAL REQUIREMENTS:**
+
+For each task, you MUST specify:
+- `permissions`: Array of tool permissions required (e.g., ["Read", "Write", "Edit", "Bash", "Glob", "Grep"])
+- `cli_params`: Exact CLI command parameters to launch the LLM with appropriate restrictions
+- `spawn_instance`: Which spawn/spawn-team instance this task belongs to
+
+For each spawn_instance, you MUST specify:
+- `id`: Unique identifier (SPAWN-XXX format)
+- `name`: Human-readable description
+- `use_spawn_team`: Whether to use ping-pong review mode (true for complex/security-sensitive tasks)
+- `cli_params`: Full CLI command to launch this instance
+- `permissions`: Union of all permissions needed by tasks in this instance
+- `task_ids`: List of task IDs that will be executed in this instance
+
+Group related tasks into spawn instances based on:
+1. Dependencies (tasks that must execute together)
+2. Security boundaries (isolate tasks with different permission levels)
+3. Efficiency (minimize spawn overhead by grouping small tasks)
+
+Use CRUISE-XXX IDs for tasks and SPAWN-XXX IDs for instances.
 
 **REMEMBER: ONLY create PLAN.md. Do NOT implement the code.**
 

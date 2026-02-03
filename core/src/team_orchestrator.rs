@@ -31,6 +31,8 @@ pub struct SpawnObservability {
     pub security_findings: Vec<SecurityFinding>,
     /// Actual sandbox path where the work was done (captured from Spawner).
     pub sandbox_path: Option<PathBuf>,
+    /// Commits made during execution.
+    pub commits: Vec<CommitRecord>,
 }
 
 /// Record of a command line invocation.
@@ -48,6 +50,23 @@ pub struct CommandLineRecord {
     pub role: String,
     /// Timestamp.
     pub timestamp: String,
+}
+
+/// Record of a commit made during execution.
+#[derive(Debug, Clone)]
+pub struct CommitRecord {
+    /// Commit hash.
+    pub hash: String,
+    /// Commit message.
+    pub message: String,
+    /// Iteration when commit was made.
+    pub iteration: u32,
+    /// Which LLM made the changes.
+    pub llm: String,
+    /// Timestamp.
+    pub timestamp: String,
+    /// Whether it was pushed to remote.
+    pub pushed: bool,
 }
 
 /// Record of a permission request.
@@ -354,6 +373,16 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             if let Some(last_cmd) = self.observability.command_lines.last_mut() {
                 last_cmd.work_dir = sandbox.clone();
             }
+
+            // Commit and push changes after each LLM run for observability
+            if result.status == SpawnStatus::Success {
+                self.commit_and_push_changes(
+                    sandbox,
+                    iteration,
+                    &self.config.primary_llm.clone(),
+                    None,
+                );
+            }
         }
 
         Ok(result)
@@ -536,6 +565,113 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         }
     }
 
+    /// Commits and pushes changes made by the LLM.
+    /// This improves observability by creating a commit for each LLM iteration.
+    fn commit_and_push_changes(
+        &mut self,
+        sandbox_path: &Path,
+        iteration: u32,
+        llm: &str,
+        phase: Option<&str>,
+    ) -> Option<String> {
+        // Check if there are changes to commit
+        let status_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()?;
+
+        let status = String::from_utf8_lossy(&status_output.stdout);
+        if status.trim().is_empty() {
+            tracing::debug!(iteration = iteration, "no changes to commit");
+            return None;
+        }
+
+        // Stage all changes
+        let add_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["add", "-A"])
+            .output()
+            .ok()?;
+
+        if !add_output.status.success() {
+            tracing::warn!(
+                error = %String::from_utf8_lossy(&add_output.stderr),
+                "failed to stage changes"
+            );
+            return None;
+        }
+
+        // Create commit message
+        let phase_str = phase.map(|p| format!(" - {}", p)).unwrap_or_default();
+        let commit_message = format!(
+            "[cruise-control] {} iteration {}{}",
+            llm, iteration, phase_str
+        );
+
+        // Commit changes
+        let commit_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["commit", "-m", &commit_message])
+            .output()
+            .ok()?;
+
+        if !commit_output.status.success() {
+            tracing::warn!(
+                error = %String::from_utf8_lossy(&commit_output.stderr),
+                "failed to commit changes"
+            );
+            return None;
+        }
+
+        // Get commit hash
+        let hash_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+
+        let hash = String::from_utf8_lossy(&hash_output.stdout).trim().to_string();
+
+        // Push to remote
+        let branch_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()?;
+
+        let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+
+        let push_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["push", "-u", "origin", &branch])
+            .output()
+            .ok();
+
+        let pushed = push_output
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        // Record commit
+        self.observability.commits.push(CommitRecord {
+            hash: hash.clone(),
+            message: commit_message,
+            iteration,
+            llm: llm.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            pushed,
+        });
+
+        tracing::info!(
+            iteration = iteration,
+            hash = %hash,
+            pushed = pushed,
+            "committed and pushed changes"
+        );
+
+        Some(hash)
+    }
+
     /// Extracts security findings from review response.
     fn extract_security_findings(&mut self, response: &str) {
         // Look for security-related keywords and extract findings
@@ -591,6 +727,22 @@ pub fn format_observability_markdown(obs: &SpawnObservability) -> String {
             md.push_str(&format!(
                 "| {} | {} | {} | {} |\n",
                 cmd.iteration, cmd.role, cmd.llm, cmd.timestamp
+            ));
+        }
+        md.push_str("\n");
+    }
+
+    // Commits
+    if !obs.commits.is_empty() {
+        md.push_str("### Commits\n\n");
+        md.push_str("| Iteration | Commit | LLM | Pushed | Timestamp |\n");
+        md.push_str("|-----------|--------|-----|--------|----------|\n");
+        for commit in &obs.commits {
+            let short_hash = commit.hash.chars().take(7).collect::<String>();
+            let pushed_icon = if commit.pushed { "✓" } else { "✗" };
+            md.push_str(&format!(
+                "| {} | `{}` | {} | {} | {} |\n",
+                commit.iteration, short_hash, commit.llm, pushed_icon, commit.timestamp
             ));
         }
         md.push_str("\n");

@@ -1,35 +1,27 @@
 # E2E Test Result: full-web-app
 
-**Status:** ✅ PASSED
+**Status:** ❌ FAILED
 
 **Date:** 2026-02-03
 
-**Time:** 00:19:06 UTC
+**Time:** 00:56:06 UTC
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
 | Fixture | `full-web-app` |
-| Spawn Success | true |
-| Overall Passed | true |
-| Repository | [`epiphytic/e2e-full-web-app-7b5b8bed`](https://github.com/epiphytic/e2e-full-web-app-7b5b8bed) |
+| Spawn Success | false |
+| Overall Passed | false |
+| Repository | [`epiphytic/e2e-full-web-app-82ff59e4`](https://github.com/epiphytic/e2e-full-web-app-82ff59e4) |
 
-## Pull Requests
+## Error
 
-- **Plan PR:** [View PR](https://github.com/Epiphytic/e2e-full-web-app-7b5b8bed/pull/1)
-
-## Validation
-
-**Passed:** true
-
-### Checks
-
-- ✅ Found expected file: Cargo.toml
-- ✅ Found expected file: src/main.rs
-- ✅ Found expected file: src/lib.rs
-- ✅ Found expected file: tests/integration.rs
-- ✅ Build passed: cargo build --release
-- ✅ Tests passed: cargo test --lib
-- ✅ E2E tests passed: cargo test --test integration
+```
+Plan PR validation failed:
+No plan PR was created
+No beads issues were created from the plan
+Planning phase failed: Primary LLM failed on iteration 2: Timed out: Idle
+Only 1 of 5 required review phases completed
+```
 

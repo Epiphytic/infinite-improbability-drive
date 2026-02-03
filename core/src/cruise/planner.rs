@@ -137,6 +137,23 @@ struct PlanJson {
     tasks: Vec<TaskJson>,
     #[serde(default)]
     risks: Vec<String>,
+    #[serde(default)]
+    spawn_instances: Vec<SpawnInstanceJson>,
+}
+
+/// Intermediate struct for parsing spawn instance JSON.
+#[derive(Debug, Deserialize)]
+struct SpawnInstanceJson {
+    id: String,
+    name: String,
+    #[serde(default)]
+    use_spawn_team: bool,
+    #[serde(default)]
+    cli_params: String,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    task_ids: Vec<String>,
 }
 
 /// Intermediate struct for parsing task JSON.
@@ -153,6 +170,12 @@ struct TaskJson {
     complexity: String,
     #[serde(default)]
     acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    cli_params: Option<String>,
+    #[serde(default)]
+    spawn_instance: Option<String>,
 }
 
 fn default_complexity() -> String {
@@ -178,6 +201,18 @@ pub fn parse_plan_json(output: &str) -> Result<CruisePlan> {
     plan.overview = parsed.overview;
     plan.risks = parsed.risks;
 
+    // Parse spawn instances
+    for instance_json in parsed.spawn_instances {
+        plan.spawn_instances.push(super::task::SpawnInstance {
+            id: instance_json.id,
+            name: instance_json.name,
+            use_spawn_team: instance_json.use_spawn_team,
+            cli_params: instance_json.cli_params,
+            permissions: instance_json.permissions,
+            task_ids: instance_json.task_ids,
+        });
+    }
+
     for task_json in parsed.tasks {
         let complexity = match task_json.complexity.to_lowercase().as_str() {
             "low" => TaskComplexity::Low,
@@ -192,6 +227,9 @@ pub fn parse_plan_json(output: &str) -> Result<CruisePlan> {
 
         task.component = task_json.component;
         task.acceptance_criteria = task_json.acceptance_criteria;
+        task.permissions = task_json.permissions;
+        task.cli_params = task_json.cli_params;
+        task.spawn_instance = task_json.spawn_instance;
 
         plan.tasks.push(task);
     }
@@ -388,13 +426,31 @@ pub fn generate_pr_body(plan: &CruisePlan, user_prompt: &str, iterations: u32) -
     body.push_str(user_prompt);
     body.push_str("\n\n</details>\n\n");
 
+    // Spawn Instances section (security-critical)
+    if !plan.spawn_instances.is_empty() {
+        body.push_str(&format!("## Spawn Instances ({})\n\n", plan.spawn_instances.len()));
+        body.push_str("**⚠️ Security Review Required**: Verify permissions and CLI parameters for each instance.\n\n");
+
+        for instance in &plan.spawn_instances {
+            body.push_str(&format!("### {} - {}\n\n", instance.id, instance.name));
+            body.push_str(&format!("- **Mode**: {}\n", if instance.use_spawn_team { "spawn-team (ping-pong)" } else { "spawn (single)" }));
+            body.push_str(&format!("- **Permissions**: `{}`\n", instance.permissions.join(", ")));
+            body.push_str(&format!("- **CLI**: `{}`\n", instance.cli_params));
+            body.push_str(&format!("- **Tasks**: {}\n\n", instance.task_ids.join(", ")));
+        }
+    }
+
     // Tasks table
     body.push_str(&format!("## Tasks ({})\n\n", plan.tasks.len()));
-    body.push_str("| ID | Subject | Component | Complexity | Dependencies |\n");
-    body.push_str("|----|---------|-----------|------------|---------------|\n");
+    body.push_str("| ID | Subject | Permissions | Spawn Instance | Dependencies |\n");
+    body.push_str("|----|---------|-------------|----------------|---------------|\n");
     for task in &plan.tasks {
-        let component = task.component.as_deref().unwrap_or("-");
-        let complexity = format!("{:?}", task.complexity).to_lowercase();
+        let permissions = if task.permissions.is_empty() {
+            "-".to_string()
+        } else {
+            task.permissions.join(", ")
+        };
+        let spawn_instance = task.spawn_instance.as_deref().unwrap_or("-");
         let deps = if task.blocked_by.is_empty() {
             "-".to_string()
         } else {
@@ -402,10 +458,33 @@ pub fn generate_pr_body(plan: &CruisePlan, user_prompt: &str, iterations: u32) -
         };
         body.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
-            task.id, task.subject, component, complexity, deps
+            task.id, task.subject, permissions, spawn_instance, deps
         ));
     }
     body.push('\n');
+
+    // Task details with CLI params
+    body.push_str("<details>\n");
+    body.push_str("<summary>Task Details with CLI Parameters</summary>\n\n");
+    for task in &plan.tasks {
+        body.push_str(&format!("#### {}: {}\n\n", task.id, task.subject));
+        body.push_str(&format!("- **Description**: {}\n", task.description));
+        body.push_str(&format!("- **Complexity**: {:?}\n", task.complexity));
+        if let Some(ref cli) = task.cli_params {
+            body.push_str(&format!("- **CLI**: `{}`\n", cli));
+        }
+        if !task.permissions.is_empty() {
+            body.push_str(&format!("- **Permissions**: `{}`\n", task.permissions.join(", ")));
+        }
+        if !task.acceptance_criteria.is_empty() {
+            body.push_str("- **Acceptance Criteria**:\n");
+            for criterion in &task.acceptance_criteria {
+                body.push_str(&format!("  - {}\n", criterion));
+            }
+        }
+        body.push('\n');
+    }
+    body.push_str("</details>\n\n");
 
     // ASCII dependency graph
     body.push_str("## Dependency Graph\n\n");
