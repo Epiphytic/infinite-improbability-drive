@@ -42,9 +42,8 @@ impl GeminiRunner {
     /// Builds the command arguments for spawning Gemini.
     fn build_args(&self, config: &LLMSpawnConfig) -> Vec<String> {
         let mut args = vec![
-            // Use plan approval mode for safe execution with auto-approved plans
-            "--approval-mode".to_string(),
-            "plan".to_string(),
+            // Use --yolo for auto-approval (--approval-mode plan requires experimental flag)
+            "--yolo".to_string(),
             // Use stream-json for structured output that shows tool calls
             "--output-format".to_string(),
             "stream-json".to_string(),
@@ -245,8 +244,7 @@ mod tests {
 
         let args = runner.build_args(&config);
 
-        assert!(args.contains(&"--approval-mode".to_string()));
-        assert!(args.contains(&"plan".to_string()));
+        assert!(args.contains(&"--yolo".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"--prompt".to_string()));

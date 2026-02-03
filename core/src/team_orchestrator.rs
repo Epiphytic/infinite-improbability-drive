@@ -257,17 +257,20 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             });
         }
 
-        // Capture sandbox path
+        // Capture sandbox path for observability
         if let Some(ref path) = primary_result.sandbox_path {
             active_sandbox_path = Some(path.clone());
         }
 
-        let default_path = sandbox_path.to_path_buf();
-        let work_sandbox = active_sandbox_path.as_ref().unwrap_or(&default_path);
+        // IMPORTANT: Use the original repo path for PR operations, not the sandbox path.
+        // The sandbox worktree is cleaned up when spawn_with_branch returns, but the
+        // branch has already been pushed to origin. We can operate on the pushed branch
+        // from the original repo.
+        let work_path = sandbox_path;
 
         // Step 2: CREATE PR ON FIRST COMMIT (shared by both modes)
         // First, verify there are commits to create a PR for
-        if !self.has_commits_on_branch(work_sandbox)? {
+        if !self.has_commits_on_branch(work_path)? {
             tracing::warn!("primary LLM didn't create any commits, cannot create PR");
             return Ok(SpawnTeamResult {
                 success: false,
@@ -279,7 +282,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         }
 
         tracing::info!("creating PR on first commit");
-        let created_pr_url = self.create_pr_on_first_commit(work_sandbox, prompt, &repo)?;
+        let created_pr_url = self.create_pr_on_first_commit(work_path, prompt, &repo)?;
         self.observability.pr_url = Some(created_pr_url.clone());
         pr_url = Some(created_pr_url.clone());
 
@@ -312,7 +315,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             );
 
             // Get current diff for this phase
-            let diff = self.get_git_diff(work_sandbox)?;
+            let diff = self.get_git_diff(work_path)?;
 
             // Run review - method differs based on mode
             let review_result = if use_github_reviews {
@@ -321,7 +324,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                     &current_prompt,
                     &diff,
                     timeout,
-                    work_sandbox,
+                    work_path,
                     *domain,
                     extracted_pr_number,
                     &repo,
@@ -334,7 +337,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                         &current_prompt,
                         &diff,
                         timeout,
-                        work_sandbox,
+                        work_path,
                         iterations,
                         Some(domain.as_str()),
                     )
@@ -364,7 +367,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                     let pending_comments = self.get_pending_review_comments(
                         extracted_pr_number,
                         &repo,
-                        work_sandbox,
+                        work_path,
                     )?;
 
                     for comment in pending_comments {
@@ -377,7 +380,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                         self.resolve_github_comment(
                             &current_prompt,
                             timeout,
-                            work_sandbox,
+                            work_path,
                             extracted_pr_number,
                             &repo,
                             comment,
@@ -391,7 +394,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                             &current_prompt,
                             &review_result,
                             timeout,
-                            work_sandbox,
+                            work_path,
                             iterations,
                             None, // Use existing branch
                         )
@@ -415,7 +418,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 self.handle_general_polish_github(
                     &current_prompt,
                     timeout,
-                    work_sandbox,
+                    work_path,
                     extracted_pr_number,
                     &repo,
                 )
@@ -580,7 +583,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         &mut self,
         prompt: &str,
         timeout: Duration,
-        work_sandbox: &Path,
+        work_path: &Path,
         pr_number: u64,
         repo: &str,
     ) -> Result<()> {
@@ -591,7 +594,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Get all comments on the PR (including user comments)
         let comments_output = Command::new("gh")
-            .current_dir(work_sandbox)
+            .current_dir(work_path)
             .args([
                 "api",
                 &format!("repos/{}/pulls/{}/comments", repo, pr_number),
@@ -665,7 +668,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                     self.resolve_github_comment(
                         prompt,
                         timeout,
-                        work_sandbox,
+                        work_path,
                         pr_number,
                         repo,
                         user_comment,
@@ -880,14 +883,14 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         // Run Gemini directly (not through spawner - it's a reviewer, not making changes)
-        // Use --print for non-interactive mode with --allowed-tools for Read access
+        // Use --yolo for auto-approval with --allowed-tools for Read access
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
             .args([
-                "--print",
+                "--yolo",  // Auto-approve all actions
                 "--allowed-tools", "Read,Glob,Grep",  // Read-only tools for review
-                "--prompt", &review_prompt,
+                "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
             ])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
@@ -1182,29 +1185,46 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Checks if the current branch has commits different from the base branch.
+    /// Checks if the pushed branch has commits different from the default branch.
     ///
     /// Returns true if there are commits that can be used to create a PR.
-    fn has_commits_on_branch(&self, sandbox_path: &Path) -> Result<bool> {
+    /// This checks remote refs since the sandbox worktree may be cleaned up.
+    fn has_commits_on_branch(&self, repo_path: &Path) -> Result<bool> {
         // Get default branch name
-        let default_branch = self.get_default_branch(sandbox_path)?;
+        let default_branch = self.get_default_branch(repo_path)?;
 
-        // Get current branch
+        // Fetch to ensure we have latest refs
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["fetch", "origin"])
+            .output();
+
+        // List remote branches that aren't the default branch
         let branch_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(repo_path)
+            .args(["branch", "-r", "--list", "origin/*"])
             .output()
-            .map_err(|e| Error::Git(format!("failed to get current branch: {}", e)))?;
+            .map_err(|e| Error::Git(format!("failed to list remote branches: {}", e)))?;
 
-        let current_branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+        let branches_str = String::from_utf8_lossy(&branch_output.stdout);
+        let feature_branch = branches_str
+            .lines()
+            .map(|s| s.trim())
+            .find(|b| b.starts_with("origin/feat") || b.starts_with("origin/feature"))
+            .map(|s| s.to_string());
 
-        // Count commits between base and current branch
+        let Some(feature_branch) = feature_branch else {
+            tracing::warn!("no feature branch found on remote");
+            return Ok(false);
+        };
+
+        // Count commits between default and feature branch
         let count_output = Command::new("git")
-            .current_dir(sandbox_path)
+            .current_dir(repo_path)
             .args([
                 "rev-list",
                 "--count",
-                &format!("{}..{}", default_branch, current_branch),
+                &format!("origin/{}..{}", default_branch, feature_branch),
             ])
             .output()
             .map_err(|e| Error::Git(format!("failed to count commits: {}", e)))?;
@@ -1216,7 +1236,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         tracing::info!(
             default_branch = %default_branch,
-            current_branch = %current_branch,
+            feature_branch = %feature_branch,
             commit_count = count,
             "checked for commits on branch"
         );
@@ -1225,37 +1245,47 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
     }
 
     /// Creates a PR on the first commit to the branch.
+    ///
+    /// Since the sandbox worktree may be cleaned up, this finds the feature branch
+    /// from remote refs instead of using the local HEAD.
     fn create_pr_on_first_commit(
         &self,
-        sandbox_path: &Path,
+        repo_path: &Path,
         prompt: &str,
         repo: &str,
     ) -> Result<String> {
-        // Get current branch
-        let branch_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .map_err(|e| Error::Git(format!("failed to get branch: {}", e)))?;
-
-        let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
-
         // Get default branch
-        let default_branch = self.get_default_branch(sandbox_path)?;
+        let default_branch = self.get_default_branch(repo_path)?;
 
-        // Push the branch first
-        let push_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["push", "-u", "origin", &branch])
+        // Fetch to ensure we have latest refs
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["fetch", "origin"])
+            .output();
+
+        // Find the feature branch from remote refs
+        let branch_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["branch", "-r", "--list", "origin/*"])
             .output()
-            .map_err(|e| Error::Git(format!("failed to push branch: {}", e)))?;
+            .map_err(|e| Error::Git(format!("failed to list remote branches: {}", e)))?;
 
-        if !push_output.status.success() {
-            tracing::warn!(
-                error = %String::from_utf8_lossy(&push_output.stderr),
-                "failed to push branch, may already be pushed"
-            );
-        }
+        let branches_str = String::from_utf8_lossy(&branch_output.stdout);
+        let feature_branch = branches_str
+            .lines()
+            .map(|s| s.trim())
+            .find(|b| b.starts_with("origin/feat") || b.starts_with("origin/feature"))
+            .map(|s| s.trim_start_matches("origin/").to_string());
+
+        let Some(branch) = feature_branch else {
+            return Err(Error::Git("no feature branch found on remote".to_string()));
+        };
+
+        tracing::info!(
+            branch = %branch,
+            default_branch = %default_branch,
+            "creating PR from remote feature branch"
+        );
 
         // Create PR title from prompt (truncate if needed)
         let title: String = prompt.chars().take(70).collect();
@@ -1280,7 +1310,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Create the PR using gh CLI
         let pr_output = Command::new("gh")
-            .current_dir(sandbox_path)
+            .current_dir(repo_path)
             .args([
                 "pr",
                 "create",
@@ -1390,15 +1420,15 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         // Run Gemini with proper CLI arguments to execute the review
-        // Using --approval-mode plan for safe execution with auto-approved plans
+        // Using --yolo for auto-approval (--approval-mode plan requires experimental flag)
         // Include Bash in --allowed-tools for `gh pr comment` access
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
             .args([
-                "--approval-mode", "plan",   // Auto-approve planned actions
+                "--yolo",  // Auto-approve all actions
                 "--allowed-tools", "Read,Glob,Grep,Bash",  // Need Bash for gh pr comment
-                "--prompt", &review_prompt,  // The review instructions
+                "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
             ])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
