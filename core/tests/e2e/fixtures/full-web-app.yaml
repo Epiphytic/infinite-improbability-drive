@@ -1,26 +1,30 @@
 name: full-web-app
-description: Simple Rust CLI app with library
+description: Full web application with SQLite, JWT auth, htmx frontend, and Rust backend
 runner: claude
 workflow: full
 
 prompt: |
-  Create a simple Rust project with the following files:
+  Build a web application that allows users to edit an SQLite database.
 
-  1. Cargo.toml - A valid Cargo manifest with name "myapp" and edition 2021
+  Requirements:
+  1. Authentication using JWT tokens
+     - A local JWT CA with local private key and certificate should exist
+     - Expose a .well-known endpoint for public keys
 
-  2. src/main.rs - A main function that:
-     - Calls a function from lib.rs
-     - Prints the result
+  2. Frontend
+     - Use htmx for the frontend
+     - Allow users to add/remove tables
+     - Allow users to change table structure (add/remove columns)
 
-  3. src/lib.rs - A library with:
-     - A public function called "add" that takes two i32 and returns their sum
-     - A public function called "greet" that takes a &str name and returns "Hello, {name}!"
+  3. Backend
+     - Use Rust for the backend
+     - Store data in SQLite
 
-  4. tests/integration.rs - Integration tests that:
-     - Test the add function with various inputs
-     - Test the greet function
-
-  Just create the files. The project should compile and pass tests.
+  4. Testing
+     - Use Playwright for E2E testing
+     - Test logging into the app using a short-lived JWT token
+     - Test adding and removing tables
+     - Test changing table structure
 
 validation:
   level: full
@@ -28,9 +32,9 @@ validation:
     - Cargo.toml
     - src/main.rs
     - src/lib.rs
-    - tests/integration.rs
+    - static/index.html
   build_command: cargo build --release
   test_command: cargo test --lib
-  e2e_command: cargo test --test integration
+  e2e_command: cargo test --test e2e
 
-timeout: 300
+timeout: 600

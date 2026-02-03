@@ -29,6 +29,8 @@ pub struct SpawnObservability {
     pub review_feedback: Vec<ReviewFeedbackRecord>,
     /// Security review findings.
     pub security_findings: Vec<SecurityFinding>,
+    /// Actual sandbox path where the work was done (captured from Spawner).
+    pub sandbox_path: Option<PathBuf>,
 }
 
 /// Record of a command line invocation.
@@ -186,9 +188,12 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
             CoordinationMode::PingPong => {
                 // Iterative: primary -> review -> fix -> review -> ...
+                // IMPORTANT: Always run all 5 review phases regardless of approval
                 let mut current_prompt = prompt.to_string();
+                let total_phases = 5; // Security, TechnicalFeasibility, TaskGranularity, DependencyCompleteness, GeneralPolish
+                let phases_to_run = total_phases.min(self.config.max_iterations);
 
-                for i in 1..=self.config.max_iterations {
+                for i in 1..=phases_to_run {
                     iterations = i;
 
                     // Run primary (or fix if not first iteration)
@@ -235,22 +240,33 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                     final_verdict = Some(review_result.verdict.clone());
                     reviews.push(review_result.clone());
 
-                    // Check if approved
+                    // Log the phase result but continue to next phase
+                    // All 5 review phases run regardless of approval in earlier phases
                     if review_result.verdict == ReviewVerdict::Approved {
-                        tracing::info!(iteration = i, "reviewer approved changes");
-                        break;
+                        tracing::info!(
+                            iteration = i,
+                            phase = %phase,
+                            "reviewer approved for this phase, continuing to next phase"
+                        );
+                        // Only build fix prompt if there are actually suggestions
+                        if !review_result.suggestions.is_empty() {
+                            current_prompt = FixPromptBuilder::new(prompt)
+                                .with_suggestions(review_result.suggestions.clone())
+                                .build();
+                        }
+                    } else {
+                        // Build fix prompt for next iteration
+                        current_prompt = FixPromptBuilder::new(prompt)
+                            .with_suggestions(review_result.suggestions.clone())
+                            .build();
+
+                        tracing::info!(
+                            iteration = i,
+                            phase = %phase,
+                            suggestions = review_result.suggestions.len(),
+                            "reviewer requested changes, preparing fix"
+                        );
                     }
-
-                    // Build fix prompt for next iteration
-                    current_prompt = FixPromptBuilder::new(prompt)
-                        .with_suggestions(review_result.suggestions.clone())
-                        .build();
-
-                    tracing::info!(
-                        iteration = i,
-                        suggestions = review_result.suggestions.len(),
-                        "reviewer requested changes, preparing fix"
-                    );
                 }
             }
         }
@@ -329,7 +345,18 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             "running primary LLM"
         );
 
-        spawner.spawn(config, manifest, Box::new(runner)).await
+        let result = spawner.spawn(config, manifest, Box::new(runner)).await?;
+
+        // Capture the actual sandbox path where work was done
+        if let Some(ref sandbox) = result.sandbox_path {
+            self.observability.sandbox_path = Some(sandbox.clone());
+            // Update the command line record with the actual work directory
+            if let Some(last_cmd) = self.observability.command_lines.last_mut() {
+                last_cmd.work_dir = sandbox.clone();
+            }
+        }
+
+        Ok(result)
     }
 
     /// Runs the reviewer LLM (Gemini).

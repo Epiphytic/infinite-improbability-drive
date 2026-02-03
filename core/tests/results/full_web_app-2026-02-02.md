@@ -1,10 +1,10 @@
 # E2E Test Result: full-web-app
 
-**Status:** ✅ PASSED
+**Status:** ❌ FAILED
 
 **Date:** 2026-02-02
 
-**Time:** 23:29:18 UTC
+**Time:** 23:58:40 UTC
 
 ## Summary
 
@@ -12,32 +12,24 @@
 |--------|-------|
 | Fixture | `full-web-app` |
 | Spawn Success | true |
-| Overall Passed | true |
-| Duration | 62.29s |
-| Repository | [`epiphytic/e2e-full-web-app-605fb74e`](https://github.com/epiphytic/e2e-full-web-app-605fb74e) |
+| Overall Passed | false |
+| Repository | [`epiphytic/e2e-full-web-app-e7d8d2ff`](https://github.com/epiphytic/e2e-full-web-app-e7d8d2ff) |
 
 ## Pull Requests
 
-- **Plan PR:** [View PR](https://github.com/Epiphytic/e2e-full-web-app-605fb74e/pull/1)
-- **Implementation PR:** [View PR](https://github.com/Epiphytic/e2e-full-web-app-605fb74e/pull/2)
-
-## Spawn Details
-
-**Spawn ID:** `cb93b07b-baa6-4bd7-ad4c-57e127ae8c21`
-
-**Summary:** Completed successfully. Files read: 0, written: 5
+- **Plan PR:** [View PR](https://github.com/Epiphytic/e2e-full-web-app-e7d8d2ff/pull/1)
 
 ## Validation
 
-**Passed:** true
+**Passed:** false
 
 ### Checks
 
-- ✅ Found expected file: Cargo.toml
-- ✅ Found expected file: src/main.rs
-- ✅ Found expected file: src/lib.rs
-- ✅ Found expected file: tests/integration.rs
+- ❌ Missing expected file: Cargo.toml
+- ❌ Missing expected file: src/main.rs
+- ❌ Missing expected file: src/lib.rs
+- ❌ Missing expected file: tests/integration.rs
 - ✅ Build passed: cargo build --release
-- ✅ Tests passed: cargo test --lib
-- ✅ E2E tests passed: cargo test --test integration
+- ❌ Tests failed: cargo test --lib
+- ❌ E2E tests failed: cargo test --test integration
 

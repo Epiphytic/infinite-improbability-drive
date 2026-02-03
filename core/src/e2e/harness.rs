@@ -1,4 +1,9 @@
 //! Main E2E test orchestrator.
+//!
+//! The E2E harness is intentionally thin - it creates ephemeral repos,
+//! kicks off CruiseRunner, and validates results. All the actual work
+//! (planning, beads issues, PRs, execution) is done by CruiseRunner.
+//! If something doesn't work, it's a bug in CruiseRunner to fix.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,6 +14,7 @@ use crate::beads::{
     commit_issue_change, BeadsClient, CreateOptions, IssueStatus, IssueType, Priority,
 };
 use crate::cruise::planner::parse_plan_json;
+use crate::cruise::runner::{CruiseRunner, PlanIssue, RunnerType as CruiseRunnerType};
 use crate::cruise::task::TaskComplexity;
 use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
@@ -20,18 +26,6 @@ use crate::team_orchestrator::SpawnObservability;
 use super::fixture::{Fixture, RunnerType, WorkflowType};
 use super::repo::EphemeralRepo;
 use super::validator::{ValidationResult, Validator};
-
-/// A beads issue created from the plan.
-#[derive(Debug, Clone)]
-struct PlanIssue {
-    /// Beads issue ID (e.g., "bd-1").
-    beads_id: String,
-    /// Original task ID from plan (e.g., "CRUISE-001").
-    #[allow(dead_code)]
-    plan_task_id: String,
-    /// Task subject/title.
-    subject: String,
-}
 
 /// Configuration for E2E test harness.
 #[derive(Debug, Clone)]
@@ -308,11 +302,21 @@ impl E2EHarness {
         }
     }
 
-    /// Runs a full workflow: plan -> approve -> execute -> validate -> PR.
+    /// Runs a full workflow using CruiseRunner.
+    ///
+    /// The harness is a thin wrapper that:
+    /// 1. Creates an ephemeral repo
+    /// 2. Calls CruiseRunner.run_full() with spawn-team enabled
+    /// 3. Auto-approves the plan PR (simulating human approval)
+    /// 4. Validates the results
+    /// 5. Reports what happened
+    ///
+    /// All the actual work (planning, beads issues, PRs, execution) is done by CruiseRunner.
+    /// If something doesn't work, it's a bug in CruiseRunner to fix.
     async fn run_full_workflow(&self, fixture: &Fixture) -> E2EResult {
         let fixture_name = fixture.name.clone();
 
-        // Create ephemeral repo with fixture name for clarity
+        // Step 1: Create ephemeral repo
         let mut repo = match EphemeralRepo::create_with_name(&self.config.org, "e2e", Some(&fixture.name)) {
             Ok(r) => r,
             Err(e) => {
@@ -334,34 +338,32 @@ impl E2EHarness {
         };
 
         let repo_name = repo.full_name();
+        let repo_path = repo.path().clone();
+        let logs_dir = repo_path.join(".cruise-logs");
+
         tracing::info!(
             fixture = %fixture.name,
             repo = %repo_name,
-            "running E2E fixture (full workflow)"
+            "running E2E fixture (full workflow via CruiseRunner)"
         );
 
-        // Phase 0: Initialize beads for issue tracking
-        if let Err(e) = self.init_beads(repo.path()) {
-            tracing::warn!(error = %e, "failed to initialize beads, continuing without issue tracking");
-        }
+        // Step 2: Create and configure CruiseRunner
+        let provider = WorktreeSandbox::new(repo_path.clone(), None);
+        let runner = CruiseRunner::new(provider, logs_dir)
+            .with_spawn_team(true)  // Enable ping-pong with Gemini reviews
+            .with_auto_approve(true);  // Auto-approve plan PR
 
-        // Phase 1: Planning
-        let planning_prompt = fixture.planning_prompt.clone().unwrap_or_else(|| {
-            self.create_planning_prompt(&fixture.prompt)
-        });
-
-        let plan_result = self
-            .run_phase(
-                &mut repo,
-                &planning_prompt,
-                fixture.runner,
-                fixture.timeout,
-                "planning",
+        // Step 3: Run CruiseRunner.run_full() - this does ALL the work
+        let cruise_result = match runner
+            .run_full(
+                &fixture.prompt,
+                CruiseRunnerType::Claude,
+                Duration::from_secs(fixture.timeout),
+                &repo_path,
             )
-            .await;
-
-        let (plan_spawn_result, plan_sandbox_path) = match plan_result {
-            Ok((result, path)) => (result, path),
+            .await
+        {
+            Ok(result) => result,
             Err(e) => {
                 if self.config.delete_on_failure {
                     let _ = repo.delete();
@@ -374,7 +376,7 @@ impl E2EHarness {
                     spawn_result: None,
                     validation: None,
                     passed: false,
-                    error: Some(format!("Planning phase failed: {}", e)),
+                    error: Some(format!("CruiseRunner failed: {}", e)),
                     pr_url: None,
                     plan_pr_url: None,
                     repo_name: Some(repo_name),
@@ -385,69 +387,48 @@ impl E2EHarness {
             }
         };
 
-        // Create beads issues from plan output (in the SANDBOX so they're part of the plan PR)
-        let plan_issues = if let Some(ref sandbox_path) = plan_sandbox_path {
-            // Pass sandbox_path as both the plan source AND the beads target
-            // This way beads issues are created in the sandbox and will be part of the plan PR
-            match self.extract_and_create_beads_issues(sandbox_path, sandbox_path) {
-                Ok(issues) => {
-                    tracing::info!(issue_count = issues.len(), "created beads issues from plan");
-                    issues
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to create beads issues from plan");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        // Extract results from CruiseRunner
+        let plan_pr_url = cruise_result
+            .plan_result
+            .as_ref()
+            .and_then(|p| p.pr_url.clone());
 
-        // Create plan PR
-        let plan_pr_url = if let Some(ref sandbox_path) = plan_sandbox_path {
-            self.commit_and_create_pr(
-                sandbox_path,
-                repo.path(),
-                &format!("{}-plan", fixture.name),
-                &planning_prompt,
-                &plan_spawn_result.spawn_id,
-            )
-        } else {
-            None
-        };
+        let pr_url = cruise_result
+            .build_result
+            .as_ref()
+            .and_then(|b| b.task_results.first())
+            .and_then(|t| t.pr_url.clone());
 
-        // Phase 2: Approve plan PR (auto-merge)
-        if let Some(ref pr_url) = plan_pr_url {
-            tracing::info!(pr_url = %pr_url, "approving plan PR");
-            if let Err(e) = self.approve_and_merge_pr(pr_url, &repo_name) {
-                tracing::warn!(error = %e, "failed to auto-merge plan PR, continuing anyway");
+        let observability = Some(cruise_result.combined_observability());
+
+        // Step 3.5: Validate plan PR requirements
+        // Fail early if plan PR doesn't meet requirements
+        let plan_validation_errors = self.validate_plan_pr(&cruise_result);
+        if !plan_validation_errors.is_empty() {
+            if self.config.delete_on_failure {
+                let _ = repo.delete();
+            } else {
+                repo.keep();
             }
+            return E2EResult {
+                fixture_name,
+                spawn_success: cruise_result.success,
+                spawn_result: None,
+                validation: None,
+                passed: false,
+                error: Some(format!("Plan PR validation failed:\n{}", plan_validation_errors.join("\n"))),
+                pr_url,
+                plan_pr_url,
+                repo_name: Some(repo_name),
+                repo_deleted: self.config.delete_on_failure,
+                observability,
+                spawn_team_result: None,
+            };
         }
 
-        // Cleanup planning sandbox
-        if let Some(sandbox_path) = plan_sandbox_path {
-            let _ = std::fs::remove_dir_all(&sandbox_path);
-        }
-
-        // Pull merged changes into repo
-        let _ = Command::new("git")
-            .args(["pull", "origin", "main"])
-            .current_dir(repo.path())
-            .output();
-
-        // Phase 3: Execution
-        let exec_result = self
-            .run_phase(
-                &mut repo,
-                &fixture.prompt,
-                fixture.runner,
-                fixture.timeout,
-                "execution",
-            )
-            .await;
-
-        let (spawn_result, exec_sandbox_path) = match exec_result {
-            Ok((result, path)) => (result, path),
+        // Step 4: Validate results (harness responsibility - checks fixture expectations)
+        let validation = match Validator::validate(&repo_path, &fixture.validation) {
+            Ok(v) => Some(v),
             Err(e) => {
                 if self.config.delete_on_failure {
                     let _ = repo.delete();
@@ -456,83 +437,24 @@ impl E2EHarness {
                 }
                 return E2EResult {
                     fixture_name,
-                    spawn_success: false,
+                    spawn_success: cruise_result.success,
                     spawn_result: None,
                     validation: None,
                     passed: false,
-                    error: Some(format!("Execution phase failed: {}", e)),
-                    pr_url: None,
-                    plan_pr_url,
-                    repo_name: Some(repo_name),
-                    repo_deleted: self.config.delete_on_failure,
-                    observability: None,
-                    spawn_team_result: None,
-                };
-            }
-        };
-
-        let spawn_success = spawn_result.status == crate::SpawnStatus::Success;
-
-        // Validate results
-        let validation_path = exec_sandbox_path
-            .as_ref()
-            .unwrap_or_else(|| repo.path());
-
-        let validation = match Validator::validate(validation_path, &fixture.validation) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                if let Some(sandbox_path) = &exec_sandbox_path {
-                    let _ = std::fs::remove_dir_all(sandbox_path);
-                }
-                if self.config.delete_on_failure {
-                    let _ = repo.delete();
-                } else {
-                    repo.keep();
-                }
-                return E2EResult {
-                    fixture_name,
-                    spawn_success,
-                    spawn_result: Some(spawn_result),
-                    validation: None,
-                    passed: false,
                     error: Some(format!("Validation error: {}", e)),
-                    pr_url: None,
+                    pr_url,
                     plan_pr_url,
                     repo_name: Some(repo_name),
                     repo_deleted: self.config.delete_on_failure,
-                    observability: None,
+                    observability,
                     spawn_team_result: None,
                 };
             }
         };
 
-        let passed = spawn_success && validation.as_ref().map(|v| v.passed).unwrap_or(false);
+        let passed = cruise_result.success && validation.as_ref().map(|v| v.passed).unwrap_or(false);
 
-        // Close beads issues with individual commits if successful
-        if passed && !plan_issues.is_empty() {
-            self.close_beads_issues(repo.path(), &plan_issues);
-        }
-
-        // Create execution PR
-        let mut pr_url = None;
-        if passed {
-            if let Some(ref sandbox_path) = exec_sandbox_path {
-                pr_url = self.commit_and_create_pr(
-                    sandbox_path,
-                    repo.path(),
-                    &fixture.name,
-                    &fixture.prompt,
-                    &spawn_result.spawn_id,
-                );
-            }
-        }
-
-        // Cleanup execution sandbox
-        if let Some(sandbox_path) = exec_sandbox_path {
-            let _ = std::fs::remove_dir_all(&sandbox_path);
-        }
-
-        // Handle repo deletion based on outcome
+        // Step 5: Handle repo cleanup
         let repo_deleted = if passed {
             if self.config.delete_on_success {
                 let _ = repo.delete();
@@ -551,18 +473,23 @@ impl E2EHarness {
             }
         };
 
+        // Step 6: Return results
         E2EResult {
             fixture_name,
-            spawn_success,
-            spawn_result: Some(spawn_result),
+            spawn_success: cruise_result.success,
+            spawn_result: None, // CruiseRunner doesn't expose individual SpawnResult
             validation,
             passed,
-            error: None,
+            error: if cruise_result.success {
+                None
+            } else {
+                Some(cruise_result.summary.clone())
+            },
             pr_url,
             plan_pr_url,
             repo_name: Some(repo_name),
             repo_deleted,
-            observability: None,
+            observability,
             spawn_team_result: None,
         }
     }
@@ -1049,5 +976,65 @@ Task to plan (do NOT implement): {}"#,
         if let Err(e) = beads.sync() {
             tracing::debug!(error = %e, "beads sync warning (expected for ephemeral repos)");
         }
+    }
+
+    /// Validates the plan PR meets all requirements.
+    /// Returns a list of validation errors (empty if all passed).
+    fn validate_plan_pr(&self, cruise_result: &crate::cruise::result::CruiseResult) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // 1. Check that plan PR was created
+        let plan_result = match &cruise_result.plan_result {
+            Some(pr) => pr,
+            None => {
+                errors.push("No plan result - planning phase did not complete".to_string());
+                return errors;
+            }
+        };
+
+        if plan_result.pr_url.is_none() {
+            errors.push("No plan PR was created".to_string());
+        }
+
+        // 2. Check that beads issues exist
+        if plan_result.task_count == 0 {
+            errors.push("No beads issues were created from the plan".to_string());
+        }
+
+        // 3. Check that plan was successful (implies plan file exists)
+        if !plan_result.success {
+            errors.push(format!(
+                "Planning phase failed: {}",
+                plan_result.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+
+        // 4. Check that all 5 review phases are present
+        if let Some(ref obs) = plan_result.observability {
+            let review_count = obs.review_feedback.len();
+            if review_count < 5 {
+                errors.push(format!(
+                    "Only {} of 5 required review phases completed",
+                    review_count
+                ));
+            }
+
+            // Check specific phases are present
+            let expected_phases = ["Security", "TechnicalFeasibility", "TaskGranularity", "DependencyCompleteness", "GeneralPolish"];
+            for (i, expected) in expected_phases.iter().enumerate() {
+                let phase_present = obs.review_feedback.iter().any(|rf| {
+                    rf.phase.as_deref() == Some(expected)
+                });
+                if !phase_present && i < review_count {
+                    // Only report missing if we should have reached this phase
+                    // (i.e., don't report phase 3 missing if we only got 2 reviews)
+                    errors.push(format!("Missing review phase: {}", expected));
+                }
+            }
+        } else {
+            errors.push("No observability data - cannot verify review phases".to_string());
+        }
+
+        errors
     }
 }

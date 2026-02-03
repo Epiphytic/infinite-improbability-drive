@@ -190,6 +190,14 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         if let Some(ref pr_url) = plan_result.pr_url {
             if self.auto_approve {
                 self.auto_approve_pr(pr_url)?;
+
+                // Pull the merged plan PR changes to local repo
+                // This ensures the execution sandbox includes the plan files
+                tracing::info!(repo_path = ?repo_path, "pulling merged plan changes");
+                let _ = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["pull", "--rebase=false", "origin", "main"])
+                    .output();
             } else {
                 // In production, would poll for approval
                 tracing::info!(pr_url = %pr_url, "plan PR created, waiting for approval");
@@ -202,6 +210,31 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             .await?;
 
         let success = build_result.success;
+
+        // If auto-approve is enabled, pull merged changes to local repo
+        // This ensures validation can see the files created by merged PRs
+        if self.auto_approve && success {
+            tracing::info!(repo_path = ?repo_path, "pulling merged changes to local repo");
+            let pull_output = Command::new("git")
+                .current_dir(repo_path)
+                .args(["pull", "--rebase=false", "origin", "main"])
+                .output();
+
+            match pull_output {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("successfully pulled merged changes");
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        error = %String::from_utf8_lossy(&output.stderr),
+                        "git pull completed with warnings"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to pull merged changes");
+                }
+            }
+        }
 
         Ok(CruiseResult {
             success,
@@ -247,15 +280,21 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
     /// Creates a planning prompt that requests structured JSON output.
     fn create_planning_prompt(&self, prompt: &str) -> String {
         format!(
-            r#"Create a detailed implementation plan for the following task.
+            r#"**THIS IS A PLANNING-ONLY PHASE. DO NOT IMPLEMENT ANYTHING.**
 
-Output your plan in two parts:
+Create a detailed implementation plan for the following task and SAVE IT TO A FILE.
 
-1. First, create a markdown document with:
-   - Overview section explaining the approach
-   - Risk Areas section listing potential issues
+**CRITICAL INSTRUCTIONS:**
+1. You MUST create a file called `PLAN.md` at the root of the repository
+2. You MUST NOT create any implementation files (no Cargo.toml, no src/, no tests/)
+3. You MUST NOT implement the task - only plan it
 
-2. Then, output a JSON block with the tasks in this exact format:
+The PLAN.md file must contain:
+
+1. A header with the plan title
+2. An Overview section explaining the approach
+3. A Risk Areas section listing potential issues
+4. A JSON block with the tasks in this exact format:
 
 ```json
 {{
@@ -275,9 +314,11 @@ Output your plan in two parts:
 }}
 ```
 
-Use CRUISE-XXX IDs. List dependencies in blocked_by using task IDs.
+Use CRUISE-XXX IDs (e.g., CRUISE-001, CRUISE-002). List dependencies in blocked_by using task IDs.
 
-Task: {}"#,
+**REMEMBER: ONLY create PLAN.md. Do NOT implement the code.**
+
+Task to plan (do NOT implement): {}"#,
             prompt
         )
     }
@@ -356,27 +397,25 @@ Task: {}"#,
             iterations = team_result.iterations,
             reviews = team_result.reviews.len(),
             success = team_result.success,
+            sandbox_path = ?observability.sandbox_path,
             "spawn-team planning completed"
         );
 
-        // For now, we need to get the sandbox_path from the last spawn
-        // This is a limitation - we should track this in the orchestrator
-        // For observability, we'll use the command_lines to identify the work directory
-        let sandbox_path = observability
-            .command_lines
-            .last()
-            .map(|cmd| cmd.work_dir.clone());
+        // Get the actual sandbox path where the work was done
+        let sandbox_path = observability.sandbox_path.clone();
 
         let mut plan_issues = Vec::new();
         let mut task_count = 0;
+        let mut parsed_plan: Option<CruisePlan> = None;
 
         // Create beads issues from plan if successful
         if team_result.success {
             if let Some(ref sandbox) = sandbox_path {
                 match self.extract_and_create_beads_issues(sandbox, repo_path) {
-                    Ok(issues) => {
+                    Ok((issues, plan)) => {
                         task_count = issues.len();
                         plan_issues = issues;
+                        parsed_plan = Some(plan);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to create beads issues from plan");
@@ -393,7 +432,7 @@ Task: {}"#,
                     sandbox,
                     repo_path,
                     original_prompt,
-                    task_count,
+                    parsed_plan.as_ref(),
                     &observability,
                     team_result.iterations,
                 )
@@ -442,14 +481,16 @@ Task: {}"#,
 
         let mut plan_issues = Vec::new();
         let mut task_count = 0;
+        let mut parsed_plan: Option<CruisePlan> = None;
 
         // Create beads issues from plan if successful
         if success {
             if let Some(ref sandbox_path) = spawn_result.sandbox_path {
                 match self.extract_and_create_beads_issues(sandbox_path, repo_path) {
-                    Ok(issues) => {
+                    Ok((issues, plan)) => {
                         task_count = issues.len();
                         plan_issues = issues;
+                        parsed_plan = Some(plan);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to create beads issues from plan");
@@ -461,7 +502,7 @@ Task: {}"#,
         // Create plan PR if successful
         let pr_url = if success {
             if let Some(ref sandbox_path) = spawn_result.sandbox_path {
-                self.create_plan_pr(sandbox_path, repo_path, original_prompt, &spawn_result, task_count)
+                self.create_plan_pr(sandbox_path, repo_path, original_prompt, &spawn_result, parsed_plan.as_ref())
             } else {
                 None
             }
@@ -493,11 +534,13 @@ Task: {}"#,
         sandbox_path: &PathBuf,
         repo_path: &PathBuf,
         prompt: &str,
-        task_count: usize,
+        parsed_plan: Option<&CruisePlan>,
         observability: &crate::team_orchestrator::SpawnObservability,
         iterations: u32,
     ) -> Option<String> {
         let pr_manager = PRManager::new(repo_path.clone());
+
+        let task_count = parsed_plan.map(|p| p.tasks.len()).unwrap_or(0);
 
         // Commit changes
         let commit_message = format!(
@@ -527,9 +570,15 @@ Task: {}"#,
             return None;
         }
 
-        // Create a plan for the PR body
-        let mut plan = CruisePlan::new(prompt);
-        plan.title = format!("Implementation Plan ({} tasks)", task_count);
+        // Use parsed plan if available, otherwise create empty plan
+        let plan = match parsed_plan {
+            Some(p) => p.clone(),
+            None => {
+                let mut empty = CruisePlan::new(prompt);
+                empty.title = "Implementation Plan".to_string();
+                empty
+            }
+        };
         let mut pr_body = generate_plan_pr_body(&plan, prompt, iterations);
 
         // Append observability section
@@ -549,11 +598,12 @@ Task: {}"#,
     }
 
     /// Extracts plan from spawn output and creates beads issues.
+    /// Returns both the created issues and the parsed plan.
     fn extract_and_create_beads_issues(
         &self,
         sandbox_path: &PathBuf,
         repo_path: &PathBuf,
-    ) -> Result<Vec<PlanIssue>> {
+    ) -> Result<(Vec<PlanIssue>, CruisePlan)> {
         // Look for plan files in the sandbox
         let plan_content = self.find_and_read_plan(sandbox_path)?;
 
@@ -563,10 +613,10 @@ Task: {}"#,
             Err(e) => {
                 tracing::warn!(error = %e, "could not parse plan JSON, creating single task");
                 // Create a single task for the whole prompt
-                let mut plan = CruisePlan::new("");
-                plan.title = "Implementation".to_string();
-                plan.tasks.push(CruiseTask::new("CRUISE-001", "Implement feature"));
-                plan
+                let mut fallback_plan = CruisePlan::new("");
+                fallback_plan.title = "Implementation".to_string();
+                fallback_plan.tasks.push(CruiseTask::new("CRUISE-001", "Implement feature"));
+                fallback_plan
             }
         };
 
@@ -652,7 +702,7 @@ Task: {}"#,
             );
         }
 
-        Ok(created_issues)
+        Ok((created_issues, plan))
     }
 
     /// Finds and reads plan content from the sandbox.
@@ -693,9 +743,11 @@ Task: {}"#,
         repo_path: &PathBuf,
         prompt: &str,
         spawn_result: &SpawnResult,
-        task_count: usize,
+        parsed_plan: Option<&CruisePlan>,
     ) -> Option<String> {
         let pr_manager = PRManager::new(repo_path.clone());
+
+        let task_count = parsed_plan.map(|p| p.tasks.len()).unwrap_or(0);
 
         // Commit changes
         let commit_message = format!(
@@ -725,9 +777,15 @@ Task: {}"#,
             return None;
         }
 
-        // Create a plan for the PR body
-        let mut plan = CruisePlan::new(prompt);
-        plan.title = format!("Implementation Plan ({} tasks)", task_count);
+        // Use parsed plan if available, otherwise create empty plan
+        let plan = match parsed_plan {
+            Some(p) => p.clone(),
+            None => {
+                let mut empty = CruisePlan::new(prompt);
+                empty.title = "Implementation Plan".to_string();
+                empty
+            }
+        };
         let pr_body = generate_plan_pr_body(&plan, prompt, 1);
 
         // Create PR
@@ -798,14 +856,12 @@ Task: {}"#,
             iterations = team_result.iterations,
             reviews = team_result.reviews.len(),
             success = team_result.success,
+            sandbox_path = ?observability.sandbox_path,
             "spawn-team execution completed"
         );
 
-        // Get sandbox_path from observability
-        let sandbox_path = observability
-            .command_lines
-            .last()
-            .map(|cmd| cmd.work_dir.clone());
+        // Get the actual sandbox path where the work was done
+        let sandbox_path = observability.sandbox_path.clone();
 
         // Close beads issues and create individual commits
         let task_results = if team_result.success {
@@ -820,15 +876,25 @@ Task: {}"#,
             .count();
 
         // Create implementation PR if successful
+        let mut impl_pr_url = None;
         if team_result.success {
             if let Some(ref sandbox) = sandbox_path {
-                self.create_implementation_pr_with_observability(
+                impl_pr_url = self.create_implementation_pr_with_observability(
                     sandbox,
                     repo_path,
                     prompt,
                     &observability,
                     team_result.iterations,
                 );
+
+                // Auto-merge the implementation PR if auto_approve is enabled
+                if self.auto_approve {
+                    if let Some(ref pr_url) = impl_pr_url {
+                        if let Err(e) = self.auto_approve_pr(pr_url) {
+                            tracing::warn!(error = %e, "failed to auto-merge implementation PR");
+                        }
+                    }
+                }
             }
         }
 
@@ -874,9 +940,19 @@ Task: {}"#,
             .count();
 
         // Create implementation PR if successful
+        let mut impl_pr_url = None;
         if success {
             if let Some(ref sandbox_path) = spawn_result.sandbox_path {
-                self.create_implementation_pr(sandbox_path, repo_path, prompt, &spawn_result);
+                impl_pr_url = self.create_implementation_pr(sandbox_path, repo_path, prompt, &spawn_result);
+
+                // Auto-merge the implementation PR if auto_approve is enabled
+                if self.auto_approve {
+                    if let Some(ref pr_url) = impl_pr_url {
+                        if let Err(e) = self.auto_approve_pr(pr_url) {
+                            tracing::warn!(error = %e, "failed to auto-merge implementation PR");
+                        }
+                    }
+                }
             }
         }
 
