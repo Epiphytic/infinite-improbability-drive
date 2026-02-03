@@ -8,6 +8,24 @@ use crate::error::{Error, Result};
 
 use super::provider::{Sandbox, SandboxManifest, SandboxProvider};
 
+/// Sanitizes a feature name for use in branch names.
+/// Converts to lowercase, replaces spaces with hyphens, removes special chars.
+fn sanitize_feature_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            ' ' | '_' => '-',
+            c if c.is_alphanumeric() || c == '-' => c,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+        .chars()
+        .take(50) // Limit length
+        .collect()
+}
+
 /// A sandbox implemented using git worktrees.
 ///
 /// This provides isolation by creating a separate worktree for each
@@ -92,6 +110,10 @@ pub struct WorktreeSandbox {
     base_dir: Option<PathBuf>,
     /// Counter for generating unique branch names (shared across clones).
     counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Feature name for branch naming (e.g., "auth-system" -> "feat/auth-system-xxx").
+    feature_name: Option<String>,
+    /// Branch prefix: "feat" or "fix".
+    branch_prefix: String,
 }
 
 impl WorktreeSandbox {
@@ -105,18 +127,47 @@ impl WorktreeSandbox {
             repo_path,
             base_dir,
             counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            feature_name: None,
+            branch_prefix: "feat".to_string(),
         }
+    }
+
+    /// Sets the feature name for branch naming.
+    /// Branch will be named like `feat/feature-name-abc123`.
+    pub fn with_feature_name(mut self, name: impl Into<String>) -> Self {
+        self.feature_name = Some(sanitize_feature_name(&name.into()));
+        self
+    }
+
+    /// Sets the branch prefix (default: "feat").
+    /// Use "fix" for bug fixes.
+    pub fn with_branch_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.branch_prefix = prefix.into();
+        self
     }
 
     fn generate_branch_name(&self) -> String {
         let id = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        format!("spawn-sandbox-{}-{}", timestamp, id)
+
+        // Generate a short unique suffix using UUID
+        let uuid = uuid::Uuid::new_v4();
+        let short_uuid = &uuid.to_string()[..8];
+
+        match &self.feature_name {
+            Some(name) if !name.is_empty() => {
+                format!("{}/{}-{}", self.branch_prefix, name, short_uuid)
+            }
+            _ => {
+                // Fallback to timestamp-based for backwards compatibility
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                format!("{}/sandbox-{}-{}", self.branch_prefix, timestamp, id)
+            }
+        }
     }
 
     fn get_worktree_path(&self, branch_name: &str) -> Result<PathBuf> {
@@ -128,7 +179,14 @@ impl WorktreeSandbox {
         // Ensure base directory exists
         std::fs::create_dir_all(&base)?;
 
-        Ok(base.join(branch_name))
+        // Use mktemp-style unique directory to prevent collisions
+        // Format: base/branch-name-XXXXXX where X is random
+        let uuid = uuid::Uuid::new_v4();
+        let short_uuid = &uuid.to_string()[..8];
+        let safe_name = branch_name.replace('/', "-");
+        let unique_dir = format!("{}-{}", safe_name, short_uuid);
+
+        Ok(base.join(unique_dir))
     }
 }
 
@@ -246,8 +304,9 @@ mod tests {
         let name2 = provider.generate_branch_name();
 
         assert_ne!(name1, name2);
-        assert!(name1.starts_with("spawn-sandbox-"));
-        assert!(name2.starts_with("spawn-sandbox-"));
+        // Default format when no feature name: feat/sandbox-{timestamp}-{id}
+        assert!(name1.starts_with("feat/sandbox-"));
+        assert!(name2.starts_with("feat/sandbox-"));
     }
 
     #[test]

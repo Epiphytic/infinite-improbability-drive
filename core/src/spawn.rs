@@ -49,11 +49,11 @@ pub struct SpawnConfig {
 }
 
 fn default_idle_timeout() -> Duration {
-    Duration::from_secs(120)
+    Duration::from_secs(300) // 5 minutes - allows thinking time for complex tasks
 }
 
 fn default_total_timeout() -> Duration {
-    Duration::from_secs(1800)
+    Duration::from_secs(3600) // 1 hour - generous for full workflow tasks
 }
 
 fn default_max_escalations() -> u32 {
@@ -355,8 +355,8 @@ mod tests {
 
         assert_eq!(config.prompt, "test prompt");
         assert_eq!(config.mode, SpawnMode::Aisp);
-        assert_eq!(config.idle_timeout, Duration::from_secs(120));
-        assert_eq!(config.total_timeout, Duration::from_secs(1800));
+        assert_eq!(config.idle_timeout, Duration::from_secs(300)); // 5 minutes for thinking time
+        assert_eq!(config.total_timeout, Duration::from_secs(3600)); // 1 hour for complex tasks
         assert_eq!(config.max_permission_escalations, 1);
     }
 

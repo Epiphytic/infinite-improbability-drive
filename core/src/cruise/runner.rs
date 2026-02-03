@@ -22,6 +22,27 @@ use super::planner::generate_pr_body as generate_plan_pr_body;
 use super::result::{BuildResult, CruiseResult, PlanResult, TaskResult};
 use super::task::{CruisePlan, CruiseTask, TaskStatus};
 
+/// Sanitizes a string for use in filenames.
+/// Converts to lowercase, replaces spaces with hyphens, removes special chars.
+fn sanitize_for_filename(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            ' ' | '_' => '-',
+            c if c.is_alphanumeric() || c == '-' => c,
+            _ => '-',
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .take(5) // Take first 5 words
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(40) // Limit total length
+        .collect()
+}
+
 /// Runner type for LLM selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunnerType {
@@ -279,15 +300,21 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
 
     /// Creates a planning prompt that requests structured JSON output.
     fn create_planning_prompt(&self, prompt: &str) -> String {
+        // Generate plan filename with date and sanitized feature name
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let feature_name = sanitize_for_filename(prompt);
+        let plan_path = format!("docs/plans/{}-cruise-control-{}.md", date, feature_name);
+
         format!(
             r#"**THIS IS A PLANNING-ONLY PHASE. DO NOT IMPLEMENT ANYTHING.**
 
 Create a detailed implementation plan for the following task and SAVE IT TO A FILE.
 
 **CRITICAL INSTRUCTIONS:**
-1. You MUST create a file called `PLAN.md` at the root of the repository
-2. You MUST NOT create any implementation files (no Cargo.toml, no src/, no tests/)
-3. You MUST NOT implement the task - only plan it
+1. First, create the `docs/plans/` directory if it doesn't exist
+2. You MUST create a file at: `{plan_path}`
+3. You MUST NOT create any implementation files (no Cargo.toml, no src/, no tests/)
+4. You MUST NOT implement the task - only plan it
 
 The PLAN.md file must contain:
 
@@ -357,10 +384,11 @@ Group related tasks into spawn instances based on:
 
 Use CRUISE-XXX IDs for tasks and SPAWN-XXX IDs for instances.
 
-**REMEMBER: ONLY create PLAN.md. Do NOT implement the code.**
+**REMEMBER: ONLY create the plan file at `{plan_path}`. Do NOT implement the code.**
 
-Task to plan (do NOT implement): {}"#,
-            prompt
+Task to plan (do NOT implement): {prompt}"#,
+            plan_path = plan_path,
+            prompt = prompt
         )
     }
 

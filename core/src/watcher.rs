@@ -71,12 +71,27 @@ pub enum TerminationReason {
     Success,
     /// LLM exited with error.
     LLMError(String),
-    /// Timeout occurred.
+    /// Timeout occurred with details for debugging.
     Timeout(TimeoutReason),
     /// Unrecoverable permission error.
     PermissionError(String),
     /// Escalation limit reached.
     EscalationLimitReached,
+}
+
+/// Detailed information about a timeout for debugging.
+#[derive(Debug, Clone, Default)]
+pub struct TimeoutDetails {
+    /// The CLI command that was running.
+    pub cli_command: String,
+    /// Last output lines received (up to 50 lines).
+    pub last_output: Vec<String>,
+    /// How long the LLM was idle before timeout.
+    pub idle_duration_secs: f64,
+    /// Total elapsed time when timeout occurred.
+    pub total_duration_secs: f64,
+    /// The timeout reason.
+    pub reason: Option<TimeoutReason>,
 }
 
 /// The watcher agent that orchestrates spawn lifecycle.
@@ -231,16 +246,28 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         let mut monitor = ProgressMonitor::new(self.config.timeout);
         let mut detected_errors = Vec::new();
 
+        // Track last output lines for timeout debugging (circular buffer of 50 lines)
+        let mut last_output_lines: Vec<String> = Vec::with_capacity(50);
+        const MAX_OUTPUT_LINES: usize = 50;
+
         // Create output channel
         let (tx, mut rx) = mpsc::channel::<LLMOutput>(100);
 
         // Build spawn config
         let spawn_config = LLMSpawnConfig {
             prompt: prompt.to_string(),
-            working_dir,
+            working_dir: working_dir.clone(),
             manifest: manifest.clone(),
             model: None,
         };
+
+        // Build CLI command string for debugging
+        let cli_command = format!(
+            "{} --print --working-dir {:?} (prompt: {}...)",
+            self.runner.name(),
+            working_dir,
+            prompt.chars().take(50).collect::<String>()
+        );
 
         // Spawn LLM in background
         let runner = self.runner.clone();
@@ -250,15 +277,48 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         while let Some(output) = rx.recv().await {
             // Check for timeout
             if let Some(reason) = monitor.check_timeout() {
+                // Log detailed timeout information for debugging
+                let timeout_details = TimeoutDetails {
+                    cli_command: cli_command.clone(),
+                    last_output: last_output_lines.clone(),
+                    idle_duration_secs: monitor.idle_duration().as_secs_f64(),
+                    total_duration_secs: monitor.total_duration().as_secs_f64(),
+                    reason: Some(reason),
+                };
+
+                tracing::error!(
+                    timeout_reason = ?reason,
+                    cli_command = %timeout_details.cli_command,
+                    idle_duration_secs = %timeout_details.idle_duration_secs,
+                    total_duration_secs = %timeout_details.total_duration_secs,
+                    last_output_lines = ?timeout_details.last_output.len(),
+                    "LLM TIMEOUT - detailed diagnostic information"
+                );
+
+                // Log the last few output lines
+                if !timeout_details.last_output.is_empty() {
+                    tracing::error!("=== Last {} output lines before timeout ===", timeout_details.last_output.len());
+                    for (i, line) in timeout_details.last_output.iter().enumerate() {
+                        tracing::error!("[{}] {}", i + 1, line);
+                    }
+                    tracing::error!("=== End of timeout output ===");
+                }
+
                 // Cancel LLM
                 llm_handle.abort();
                 return Ok((ProgressSummary::from(&monitor), Some(reason)));
             }
 
-            // Process output
+            // Process output and track for timeout debugging
             match &output {
                 LLMOutput::Stdout(line) => {
                     monitor.record_output(1);
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[stdout] {}", line));
 
                     // Check for permission errors
                     if let Some(error) = self.detector.analyze(line) {
@@ -268,6 +328,12 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                 LLMOutput::Stderr(line) => {
                     monitor.record_output(1);
 
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[stderr] {}", line));
+
                     // Check for permission errors
                     if let Some(error) = self.detector.analyze(line) {
                         detected_errors.push(error);
@@ -275,12 +341,30 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                 }
                 LLMOutput::FileRead(path) => {
                     monitor.record_file_read(path.clone());
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[file_read] {:?}", path));
                 }
                 LLMOutput::FileWrite(path) => {
                     monitor.record_file_write(path.clone());
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[file_write] {:?}", path));
                 }
-                LLMOutput::ToolCall { .. } => {
+                LLMOutput::ToolCall { tool, .. } => {
                     monitor.touch();
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[tool_call] {}", tool));
                 }
             }
         }
