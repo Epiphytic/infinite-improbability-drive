@@ -1141,6 +1141,9 @@ You must implement the following task. There is a detailed plan available in the
                 if let Some(ref pr_url) = impl_pr_url {
                     if let Err(e) = self.auto_approve_pr(pr_url) {
                         tracing::warn!(error = %e, "failed to auto-merge implementation PR");
+                    } else {
+                        // Sync local repo with merged changes for validation
+                        self.sync_with_remote(repo_path);
                     }
                 }
             }
@@ -1206,6 +1209,9 @@ You must implement the following task. There is a detailed plan available in the
                     if let Some(ref pr_url) = impl_pr_url {
                         if let Err(e) = self.auto_approve_pr(pr_url) {
                             tracing::warn!(error = %e, "failed to auto-merge implementation PR");
+                        } else {
+                            // Sync local repo with merged changes for validation
+                            self.sync_with_remote(repo_path);
                         }
                     }
                 }
@@ -1481,6 +1487,46 @@ You must implement the following task. There is a detailed plan available in the
 
         tracing::info!(pr_number = %pr_number, "auto-merged PR");
         Ok(())
+    }
+
+    /// Syncs local repo with remote after PR merge.
+    ///
+    /// This ensures validation runs against the merged content.
+    fn sync_with_remote(&self, repo_path: &PathBuf) {
+        tracing::info!(repo_path = ?repo_path, "syncing local repo with merged changes");
+
+        // Fetch latest from origin
+        let fetch_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["fetch", "origin", "main"])
+            .output();
+
+        if let Ok(output) = fetch_output {
+            if !output.status.success() {
+                tracing::warn!(
+                    error = %String::from_utf8_lossy(&output.stderr),
+                    "git fetch failed"
+                );
+                return;
+            }
+        }
+
+        // Reset to origin/main to get merged content
+        let reset_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["reset", "--hard", "origin/main"])
+            .output();
+
+        if let Ok(output) = reset_output {
+            if output.status.success() {
+                tracing::info!("successfully synced local repo with merged implementation");
+            } else {
+                tracing::warn!(
+                    error = %String::from_utf8_lossy(&output.stderr),
+                    "git reset failed"
+                );
+            }
+        }
     }
 }
 
