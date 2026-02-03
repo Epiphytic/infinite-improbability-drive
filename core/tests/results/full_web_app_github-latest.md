@@ -1,23 +1,23 @@
-# E2E Test Result: full-web-app
+# E2E Test Result: full-web-app-github
 
 **Status:** ❌ FAILED
 
 **Date:** 2026-02-03
 
-**Time:** 05:07:54 UTC
+**Time:** 09:25:19 UTC
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
-| Fixture | `full-web-app` |
-| Spawn Success | true |
+| Fixture | `full-web-app-github` |
+| Spawn Success | false |
 | Overall Passed | false |
-| Repository | [`epiphytic/e2e-full-web-app-24320728`](https://github.com/epiphytic/e2e-full-web-app-24320728) |
+| Repository | [`epiphytic/e2e-full-web-app-github-39ec3858`](https://github.com/epiphytic/e2e-full-web-app-github-39ec3858) |
 
 ## Pull Requests
 
-- **Plan PR:** [View PR](https://github.com/Epiphytic/e2e-full-web-app-24320728/pull/1)
+- **Plan PR:** [View PR](https://github.com/Epiphytic/e2e-full-web-app-github-39ec3858/pull/1)
 
 ## Validation
 
@@ -34,4 +34,10 @@
 - ✅ Build passed: cargo build --release
 - ✅ Tests passed: cargo test --lib
 - ❌ E2E tests failed: cargo test --test e2e
+
+## Error
+
+```
+Execution phase failed
+```
 

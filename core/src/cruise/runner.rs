@@ -209,6 +209,7 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             plan_result: None,
             build_result: Some(BuildResult {
                 success,
+                summary: spawn_result.summary.clone(),
                 task_results: vec![],
                 max_parallelism: 1,
                 duration: spawn_result.duration,
@@ -359,6 +360,13 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             }
         }
 
+        // Use build_result summary for detailed error message
+        let summary = if success {
+            "Full workflow completed successfully".to_string()
+        } else {
+            format!("Execution phase failed: {}", build_result.summary)
+        };
+
         Ok(CruiseResult {
             success,
             prompt: prompt.to_string(),
@@ -366,11 +374,7 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             build_result: Some(build_result),
             validation_result: None,
             total_duration: start.elapsed(),
-            summary: if success {
-                "Full workflow completed successfully".to_string()
-            } else {
-                "Execution phase failed".to_string()
-            },
+            summary,
         })
     }
 
@@ -1151,6 +1155,7 @@ You must implement the following task. There is a detailed plan available in the
 
         Ok(BuildResult {
             success: team_result.success,
+            summary: team_result.summary.clone(),
             task_results,
             max_parallelism: 1,
             duration: start.elapsed(),
@@ -1220,6 +1225,7 @@ You must implement the following task. There is a detailed plan available in the
 
         Ok(BuildResult {
             success,
+            summary: spawn_result.summary.clone(),
             task_results,
             max_parallelism: 1,
             duration: start.elapsed(),

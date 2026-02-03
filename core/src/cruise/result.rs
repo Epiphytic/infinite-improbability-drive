@@ -47,6 +47,8 @@ pub struct TaskResult {
 pub struct BuildResult {
     /// Whether build succeeded.
     pub success: bool,
+    /// Summary of the build phase (includes failure reason if not successful).
+    pub summary: String,
     /// Results for each task.
     pub task_results: Vec<TaskResult>,
     /// Maximum parallelism achieved.

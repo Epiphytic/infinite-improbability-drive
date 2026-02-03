@@ -88,6 +88,8 @@ impl LLMRunner for ClaudeRunner {
         let mut child = Command::new(&self.cli_path)
             .args(&args)
             .current_dir(&config.working_dir)
+            // Disable fork-join plugin to avoid conflicts with cruise-control
+            .env("FORK_JOIN_DISABLED", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())

@@ -415,34 +415,46 @@ impl GitHubReviewPromptBuilder {
         prompt.push_str("\n```\n\n");
 
         prompt.push_str("### Instructions\n\n");
-        prompt.push_str("You MUST use the `gh` CLI to submit your review. Use this command:\n\n");
+        prompt.push_str("You MUST use the `gh` CLI to submit your feedback as PR comments.\n\n");
+
+        prompt.push_str(
+            "**NOTE:** You cannot use `gh pr review --request-changes` on your own PRs. ",
+        );
+        prompt.push_str("Use PR comments instead to provide feedback.\n\n");
+
+        prompt.push_str("If you find issues that need addressing, add a summary comment:\n\n");
         prompt.push_str("```bash\n");
         prompt.push_str(&format!(
-            "gh pr review {} --repo {} --request-changes --body \"Your review summary\"\n",
-            self.pr_number, self.repo
+            "gh pr comment {} --repo {} --body \"[{} REVIEW - NEEDS CHANGES]\n\n<your detailed findings>\"\n",
+            self.pr_number, self.repo, self.domain.as_str().to_uppercase()
         ));
         prompt.push_str("```\n\n");
 
-        prompt.push_str("For line-specific comments, use:\n\n");
+        prompt.push_str("For line-specific comments on specific files, use:\n\n");
         prompt.push_str("```bash\n");
         prompt.push_str(&format!(
-            "gh pr review {} --repo {} --comment --body \"Comment on specific line\" \\\n",
-            self.pr_number, self.repo
+            "gh api repos/{}/pulls/{}/comments --method POST \\\n",
+            self.repo, self.pr_number
         ));
-        prompt.push_str("  --path \"path/to/file\" --line 42\n");
+        prompt.push_str("  -f body=\"Your comment\" -f path=\"path/to/file\" -F line=42 -f commit_id=\"$(gh pr view --repo ");
+        prompt.push_str(&format!(
+            "{} {} --json headRefOid --jq .headRefOid)\"\n",
+            self.repo, self.pr_number
+        ));
         prompt.push_str("```\n\n");
 
-        prompt.push_str("If the code passes this review domain with no issues, use:\n\n");
+        prompt.push_str("If the code passes this review domain with no issues, add:\n\n");
         prompt.push_str("```bash\n");
         prompt.push_str(&format!(
-            "gh pr review {} --repo {} --approve --body \"{} review passed\"\n",
+            "gh pr comment {} --repo {} --body \"[{} REVIEW - APPROVED]\n\n{} review passed with no issues.\"\n",
             self.pr_number,
             self.repo,
+            self.domain.as_str().to_uppercase(),
             self.domain.as_str()
         ));
         prompt.push_str("```\n\n");
 
-        prompt.push_str("IMPORTANT: You must ONLY create GitHub reviews using the `gh` command. ");
+        prompt.push_str("IMPORTANT: You must ONLY create comments using the `gh` command. ");
         prompt.push_str("Do not make any other changes to the repository. ");
         prompt.push_str(
             "Your entire output should be the `gh` commands you run and their results.\n",
@@ -765,9 +777,15 @@ mod tests {
         assert!(prompt.contains("Security Domain"));
         assert!(prompt.contains("Fix the auth bug"));
         assert!(prompt.contains("+ new code"));
-        assert!(prompt.contains("gh pr review 123"));
+        assert!(prompt.contains("gh pr comment 123"));
         assert!(prompt.contains("--repo owner/repo"));
-        assert!(prompt.contains("--request-changes"));
+        assert!(prompt.contains("[SECURITY REVIEW - NEEDS CHANGES]"));
+        assert!(prompt.contains("[SECURITY REVIEW - APPROVED]"));
+        // Verify we mention the limitation about request-changes (explains why we use comments)
+        assert!(prompt.contains("cannot use `gh pr review --request-changes`"));
+        // Verify we DON'T have a command line suggesting to use --request-changes
+        // (we only mention it in the explanation)
+        assert!(!prompt.contains("gh pr review 123 --repo owner/repo --request-changes"));
     }
 
     #[test]

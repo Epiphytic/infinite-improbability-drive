@@ -20,10 +20,10 @@ use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::WorktreeSandbox;
 use crate::spawn::{SpawnConfig, SpawnResult, Spawner};
-use crate::team::SpawnTeamResult;
+use crate::team::{CoordinationMode, SpawnTeamResult};
 use crate::team_orchestrator::SpawnObservability;
 
-use super::fixture::{Fixture, RunnerType, WorkflowType};
+use super::fixture::{Fixture, RunnerType, TeamMode, WorkflowType};
 use super::repo::EphemeralRepo;
 use super::validator::{ValidationResult, Validator};
 
@@ -349,8 +349,16 @@ impl E2EHarness {
 
         // Step 2: Create and configure CruiseRunner
         let provider = WorktreeSandbox::new(repo_path.clone(), None);
+
+        // Convert fixture team_mode to CoordinationMode
+        let team_mode = match fixture.team_mode {
+            TeamMode::PingPong => CoordinationMode::PingPong,
+            TeamMode::GitHub => CoordinationMode::GitHub,
+        };
+
         let runner = CruiseRunner::new(provider, logs_dir)
-            .with_spawn_team(true)  // Enable ping-pong with Gemini reviews
+            .with_spawn_team(true)  // Enable spawn-team with Gemini reviews
+            .with_team_mode(team_mode)  // Use the fixture's team mode
             .with_auto_approve(true);  // Auto-approve plan PR
 
         // Step 3: Run CruiseRunner.run_full() - this does ALL the work

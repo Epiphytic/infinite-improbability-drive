@@ -28,6 +28,17 @@ pub enum WorkflowType {
     Full,
 }
 
+/// Team coordination mode for spawn-team operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMode {
+    /// PingPong mode: iterative back-and-forth between primary and reviewer.
+    #[default]
+    PingPong,
+    /// GitHub mode: PR-based coordination with GitHub reviews.
+    GitHub,
+}
+
 /// Validation level for test results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +129,14 @@ pub struct Fixture {
     /// Timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+
+    /// Team coordination mode (for spawn-team operations).
+    #[serde(default)]
+    pub team_mode: TeamMode,
+
+    /// Environment variables to set when running LLMs.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 fn default_timeout() -> u64 {

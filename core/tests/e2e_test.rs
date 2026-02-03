@@ -265,7 +265,8 @@ fn update_results_index() {
     md.push_str("|------|-------------|\n");
     md.push_str("| `smoke_hello` | Basic smoke test - create simple file |\n");
     md.push_str("| `code_generation` | Generate Rust code with tests |\n");
-    md.push_str("| `full_web_app` | Full workflow: Rust CLI with lib and integration tests |\n");
+    md.push_str("| `full_web_app` | Full workflow with PingPong mode |\n");
+    md.push_str("| `full_web_app_github` | Full workflow with GitHub PR-based reviews |\n");
     md.push_str("| `full_workflow_simple` | Full plan→approve→execute workflow |\n");
     md.push_str("| `smoke_hello_gemini` | Smoke test using Gemini instead of Claude |\n");
 
@@ -364,6 +365,30 @@ async fn full_workflow_simple() {
         assert!(
             result.pr_url.is_some(),
             "Full workflow should create an implementation PR"
+        );
+    }
+
+    assert!(result.passed, "E2E test failed: {:?}", result.error);
+}
+
+/// Test the full workflow with GitHub PR-based coordination mode.
+/// This uses GitHub reviews with line comments instead of ping-pong.
+#[tokio::test]
+#[ignore]
+async fn full_web_app_github() {
+    let harness = create_harness();
+    let fixture = Fixture::load(fixtures_dir().join("full-web-app-github.yaml"))
+        .expect("failed to load fixture");
+
+    let result = harness.run_fixture(&fixture).await;
+    print_result(&result);
+    write_result_markdown(&result, "full_web_app_github");
+
+    // For GitHub mode, we expect PR to be created early with reviews
+    if result.passed {
+        assert!(
+            result.plan_pr_url.is_some(),
+            "GitHub mode should create a plan PR"
         );
     }
 
