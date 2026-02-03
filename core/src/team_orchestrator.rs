@@ -142,16 +142,23 @@ pub struct SpawnTeamOrchestrator<P: SandboxProvider + Clone> {
     provider: P,
     logs_dir: PathBuf,
     observability: SpawnObservability,
+    /// Environment variables to pass to LLM processes.
+    env_vars: std::collections::HashMap<String, String>,
 }
 
 impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
     /// Creates a new orchestrator.
     pub fn new(provider: P, logs_dir: PathBuf) -> Self {
+        // Default env vars include FORK_JOIN_DISABLED to avoid conflicts
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert("FORK_JOIN_DISABLED".to_string(), "1".to_string());
+
         Self {
             config: SpawnTeamConfig::default(),
             provider,
             logs_dir,
             observability: SpawnObservability::default(),
+            env_vars,
         }
     }
 
@@ -186,7 +193,17 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
     /// Runs the spawn-team workflow with an explicit branch name.
     ///
-    /// This allows CruiseRunner to control branch naming per workflow phase.
+    /// Both PingPong and GitHub modes share the same core flow:
+    /// 1. Primary creates initial work (plan or implementation)
+    /// 2. Watcher pulls changes, commits, pushes
+    /// 3. **PR is created on first commit** (shared)
+    /// 4. Review phases run: Security → Technical Feasibility → Task Granularity →
+    ///    Dependency Completeness → General Polish
+    /// 5. Each phase: reviewer reviews, coder fixes
+    ///
+    /// The only difference is how reviews are delivered:
+    /// - PingPong: review as stdout, appended to PR body
+    /// - GitHub: review as `gh pr review --request-changes` with line comments
     pub async fn run_with_branch(
         &mut self,
         prompt: &str,
@@ -194,310 +211,229 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         sandbox_path: &Path,
         branch_name: Option<&str>,
     ) -> Result<SpawnTeamResult> {
-        let start = Instant::now();
+        let _start = Instant::now();
         let mut iterations = 0;
         let mut reviews = Vec::new();
         let mut final_verdict = None;
 
-        match self.config.mode {
-            CoordinationMode::Sequential => {
-                // Single iteration: primary -> review -> fix
-                iterations = 1;
+        // Get repo name for PR operations (needed for both modes)
+        let repo = self.get_repo_name(sandbox_path)?;
 
-                // Run primary
-                let primary_result = self
-                    .run_primary(prompt, timeout, sandbox_path, iterations, branch_name)
-                    .await?;
+        // Track the sandbox path across iterations
+        let mut active_sandbox_path: Option<PathBuf> = None;
+        let mut pr_url: Option<String> = None;
 
-                if primary_result.status != SpawnStatus::Success {
-                    return Ok(SpawnTeamResult {
-                        success: false,
+        // Determine if this is GitHub mode (affects how reviews are posted)
+        let use_github_reviews = matches!(self.config.mode, CoordinationMode::GitHub);
+
+        // Legacy sequential mode - kept for backwards compatibility
+        if matches!(self.config.mode, CoordinationMode::Sequential) {
+            return self
+                .run_sequential_mode(prompt, timeout, sandbox_path, branch_name)
+                .await;
+        }
+
+        // ========================================
+        // SHARED FLOW: PingPong and GitHub modes
+        // ========================================
+
+        // Step 1: Run primary to create initial work
+        tracing::info!(
+            mode = ?self.config.mode,
+            "starting spawn-team: running primary LLM"
+        );
+
+        let primary_result = self
+            .run_primary(prompt, timeout, sandbox_path, 1, branch_name)
+            .await?;
+
+        if primary_result.status != SpawnStatus::Success {
+            return Ok(SpawnTeamResult {
+                success: false,
+                iterations: 1,
+                final_verdict: None,
+                reviews,
+                summary: format!("Primary LLM failed: {}", primary_result.summary),
+            });
+        }
+
+        // Capture sandbox path
+        if let Some(ref path) = primary_result.sandbox_path {
+            active_sandbox_path = Some(path.clone());
+        }
+
+        let default_path = sandbox_path.to_path_buf();
+        let work_sandbox = active_sandbox_path.as_ref().unwrap_or(&default_path);
+
+        // Step 2: CREATE PR ON FIRST COMMIT (shared by both modes)
+        // First, verify there are commits to create a PR for
+        if !self.has_commits_on_branch(work_sandbox)? {
+            tracing::warn!("primary LLM didn't create any commits, cannot create PR");
+            return Ok(SpawnTeamResult {
+                success: false,
+                iterations: 1,
+                final_verdict: None,
+                reviews,
+                summary: "Primary LLM completed but made no commits. No code changes were produced.".to_string(),
+            });
+        }
+
+        tracing::info!("creating PR on first commit");
+        let created_pr_url = self.create_pr_on_first_commit(work_sandbox, prompt, &repo)?;
+        self.observability.pr_url = Some(created_pr_url.clone());
+        pr_url = Some(created_pr_url.clone());
+
+        // Extract PR number for API operations
+        let extracted_pr_number = self.extract_pr_number(&created_pr_url)?;
+
+        tracing::info!(
+            pr_url = %created_pr_url,
+            pr_number = extracted_pr_number,
+            "PR created on first commit"
+        );
+
+        // Step 3: Run review phases
+        // All 5 phases: Security, TechnicalFeasibility, TaskGranularity,
+        // DependencyCompleteness, GeneralPolish
+        let review_phases = ReviewDomain::all();
+        let phases_to_run = review_phases.len().min(self.config.max_iterations as usize);
+        let mut current_prompt = prompt.to_string();
+
+        for (phase_idx, domain) in review_phases.iter().take(phases_to_run).enumerate() {
+            iterations = (phase_idx + 1) as u32;
+            let is_last_phase = phase_idx == phases_to_run - 1;
+
+            tracing::info!(
+                domain = %domain.as_str(),
+                iteration = iterations,
+                is_last_phase = is_last_phase,
+                use_github_reviews = use_github_reviews,
+                "starting review phase"
+            );
+
+            // Get current diff for this phase
+            let diff = self.get_git_diff(work_sandbox)?;
+
+            // Run review - method differs based on mode
+            let review_result = if use_github_reviews {
+                // GitHub mode: reviewer creates GitHub review with line comments
+                self.run_github_reviewer(
+                    &current_prompt,
+                    &diff,
+                    timeout,
+                    work_sandbox,
+                    *domain,
+                    extracted_pr_number,
+                    &repo,
+                )
+                .await?
+            } else {
+                // PingPong mode: reviewer outputs to stdout
+                let review = self
+                    .run_reviewer(
+                        &current_prompt,
+                        &diff,
+                        timeout,
+                        work_sandbox,
                         iterations,
-                        final_verdict: None,
-                        reviews,
-                        summary: format!("Primary LLM failed: {}", primary_result.summary),
-                    });
-                }
-
-                // Get diff for review
-                let diff = self.get_git_diff(sandbox_path)?;
-
-                // Run reviewer
-                let review_result = self
-                    .run_reviewer(prompt, &diff, timeout, sandbox_path, iterations, None)
+                        Some(domain.as_str()),
+                    )
                     .await?;
 
-                final_verdict = Some(review_result.verdict.clone());
-                reviews.push(review_result.clone());
-
-                // If needs changes, run fix phase
-                if review_result.verdict == ReviewVerdict::NeedsChanges {
-                    let _fix_result = self
-                        .run_fix(prompt, &review_result, timeout, sandbox_path, iterations, branch_name)
-                        .await?;
-                }
-            }
-
-            CoordinationMode::PingPong => {
-                // Iterative: primary -> review -> fix -> review -> ...
-                // IMPORTANT: Always run all 5 review phases regardless of approval
-                let mut current_prompt = prompt.to_string();
-                let total_phases = 5; // Security, TechnicalFeasibility, TaskGranularity, DependencyCompleteness, GeneralPolish
-                let phases_to_run = total_phases.min(self.config.max_iterations);
-
-                // Track the sandbox path from the first iteration to reuse for subsequent iterations
-                let mut active_sandbox_path: Option<PathBuf> = None;
-
-                for i in 1..=phases_to_run {
-                    iterations = i;
-
-                    // Run primary (or fix if not first iteration)
-                    // First iteration: create sandbox with branch name
-                    // Subsequent iterations: reuse the existing sandbox
-                    let primary_result = if i == 1 {
-                        // First iteration - create the sandbox with the branch
-                        let result = self
-                            .run_primary(&current_prompt, timeout, sandbox_path, i, branch_name)
-                            .await?;
-                        // Capture the sandbox path for reuse
-                        if let Some(ref path) = result.sandbox_path {
-                            active_sandbox_path = Some(path.clone());
-                        }
-                        result
-                    } else {
-                        // Subsequent iterations - run on the existing sandbox
-                        // Pass None for branch_name to use the existing worktree
-                        if let Some(ref existing_sandbox) = active_sandbox_path {
-                            self.run_primary_on_existing_sandbox(&current_prompt, timeout, existing_sandbox, i)
-                                .await?
-                        } else {
-                            // Fallback: create new sandbox if we lost track (shouldn't happen)
-                            self.run_primary(&current_prompt, timeout, sandbox_path, i, None)
-                                .await?
-                        }
-                    };
-
-                    if primary_result.status != SpawnStatus::Success {
-                        return Ok(SpawnTeamResult {
-                            success: false,
-                            iterations,
-                            final_verdict: None,
-                            reviews,
-                            summary: format!(
-                                "Primary LLM failed on iteration {}: {}",
-                                i, primary_result.summary
-                            ),
-                        });
-                    }
-
-                    // Update active sandbox path if it changed
-                    if let Some(ref path) = primary_result.sandbox_path {
-                        active_sandbox_path = Some(path.clone());
-                    }
-
-                    // Get diff for review - use the active sandbox path
-                    let default_path = sandbox_path.to_path_buf();
-                    let diff_sandbox = active_sandbox_path.as_ref().unwrap_or(&default_path);
-                    let diff = self.get_git_diff(diff_sandbox)?;
-
-                    // Determine review phase based on iteration
-                    let phase = self.get_review_phase(i);
-
-                    // Run reviewer
-                    let review_result = self
-                        .run_reviewer(
-                            prompt,
-                            &diff,
-                            timeout,
-                            sandbox_path,
-                            i,
-                            Some(phase.as_str()),
-                        )
-                        .await?;
-
-                    final_verdict = Some(review_result.verdict.clone());
-                    reviews.push(review_result.clone());
-
-                    // Log the phase result but continue to next phase
-                    // All 5 review phases run regardless of approval in earlier phases
-                    if review_result.verdict == ReviewVerdict::Approved {
-                        tracing::info!(
-                            iteration = i,
-                            phase = %phase,
-                            "reviewer approved for this phase, continuing to next phase"
-                        );
-                        // Only build fix prompt if there are actually suggestions
-                        if !review_result.suggestions.is_empty() {
-                            current_prompt = FixPromptBuilder::new(prompt)
-                                .with_suggestions(review_result.suggestions.clone())
-                                .build();
-                        }
-                    } else {
-                        // Build fix prompt for next iteration
-                        current_prompt = FixPromptBuilder::new(prompt)
-                            .with_suggestions(review_result.suggestions.clone())
-                            .build();
-
-                        tracing::info!(
-                            iteration = i,
-                            phase = %phase,
-                            suggestions = review_result.suggestions.len(),
-                            "reviewer requested changes, preparing fix"
-                        );
-                    }
-                }
-            }
-
-            CoordinationMode::GitHub => {
-                // GitHub-based workflow:
-                // 1. Primary creates initial implementation
-                // 2. Create PR on first commit
-                // 3. Reviewers create GitHub reviews with line comments
-                // 4. Coder resolves each comment with commits
-                // 5. All domains reviewed in sequence
-
-                let repo = self.get_repo_name(sandbox_path)?;
-
-                // Track the sandbox path from the first iteration
-                let mut active_sandbox_path: Option<PathBuf> = None;
-
-                // Step 1: Run primary to create initial implementation
-                tracing::info!("GitHub mode: running primary LLM for initial implementation");
-                let primary_result = self
-                    .run_primary(prompt, timeout, sandbox_path, 1, branch_name)
-                    .await?;
-
-                if primary_result.status != SpawnStatus::Success {
-                    return Ok(SpawnTeamResult {
-                        success: false,
-                        iterations: 1,
-                        final_verdict: None,
-                        reviews,
-                        summary: format!("Primary LLM failed: {}", primary_result.summary),
-                    });
+                // Append review to PR body for traceability
+                if let Some(ref url) = pr_url {
+                    self.append_review_to_pr(url, &review, domain)?;
                 }
 
-                // Capture sandbox path
-                if let Some(ref path) = primary_result.sandbox_path {
-                    active_sandbox_path = Some(path.clone());
-                }
+                review
+            };
 
-                let default_path = sandbox_path.to_path_buf();
-                let work_sandbox = active_sandbox_path.as_ref().unwrap_or(&default_path);
+            reviews.push(review_result.clone());
+            final_verdict = Some(review_result.verdict.clone());
 
-                // Step 2: Create PR on first commit
-                let pr_url = self.create_pr_on_first_commit(work_sandbox, prompt, &repo)?;
-                self.observability.pr_url = Some(pr_url.clone());
-
-                // Extract PR number from URL
-                let pr_number = self.extract_pr_number(&pr_url)?;
-
+            // If review requested changes, run coder to fix
+            if review_result.verdict == ReviewVerdict::NeedsChanges {
                 tracing::info!(
-                    pr_url = %pr_url,
-                    pr_number = pr_number,
-                    "GitHub mode: created PR on first commit"
+                    domain = %domain.as_str(),
+                    suggestions = review_result.suggestions.len(),
+                    "reviewer requested changes, running coder to fix"
                 );
 
-                // Step 3: Run each review domain
-                for domain in ReviewDomain::all() {
-                    iterations += 1;
+                if use_github_reviews {
+                    // GitHub mode: resolve each comment with commits
+                    let pending_comments = self.get_pending_review_comments(
+                        extracted_pr_number,
+                        &repo,
+                        work_sandbox,
+                    )?;
 
-                    tracing::info!(
-                        domain = %domain.as_str(),
-                        iteration = iterations,
-                        "GitHub mode: starting review domain"
-                    );
+                    for comment in pending_comments {
+                        tracing::info!(
+                            comment_id = comment.id,
+                            path = %comment.path,
+                            "resolving GitHub review comment"
+                        );
 
-                    // Get current diff for this domain
-                    let diff = self.get_git_diff(work_sandbox)?;
-
-                    // Run reviewer for this domain - creates GitHub review
-                    let review = self
-                        .run_github_reviewer(
-                            prompt,
-                            &diff,
+                        self.resolve_github_comment(
+                            &current_prompt,
                             timeout,
                             work_sandbox,
-                            *domain,
-                            pr_number,
+                            extracted_pr_number,
                             &repo,
+                            comment,
                         )
                         .await?;
-
-                    reviews.push(review.clone());
-                    final_verdict = Some(review.verdict.clone());
-
-                    // If review requested changes, resolve comments
-                    if review.verdict == ReviewVerdict::NeedsChanges {
-                        // Get pending comments from the PR
-                        let pending_comments =
-                            self.get_pending_review_comments(pr_number, &repo, work_sandbox)?;
-
-                        // Resolve each comment
-                        for comment in pending_comments {
-                            tracing::info!(
-                                comment_id = comment.id,
-                                path = %comment.path,
-                                "GitHub mode: resolving review comment"
-                            );
-
-                            self.resolve_github_comment(
-                                prompt,
-                                timeout,
-                                work_sandbox,
-                                pr_number,
-                                &repo,
-                                comment,
-                            )
-                            .await?;
-                        }
                     }
+                } else {
+                    // PingPong mode: run fix phase
+                    let _fix_result = self
+                        .run_fix(
+                            &current_prompt,
+                            &review_result,
+                            timeout,
+                            work_sandbox,
+                            iterations,
+                            None, // Use existing branch
+                        )
+                        .await?;
                 }
 
-                // Final success is determined by the last review phase
-                let success = final_verdict
-                    .as_ref()
-                    .map(|v| *v == ReviewVerdict::Approved)
-                    .unwrap_or(false);
+                // Update prompt with suggestions for next phase
+                current_prompt = FixPromptBuilder::new(prompt)
+                    .with_suggestions(review_result.suggestions.clone())
+                    .build();
+            } else {
+                tracing::info!(
+                    domain = %domain.as_str(),
+                    "reviewer approved this phase"
+                );
+            }
 
-                return Ok(SpawnTeamResult {
-                    success,
-                    iterations,
-                    final_verdict,
-                    reviews,
-                    summary: format!(
-                        "GitHub workflow completed. PR: {}. {} domains reviewed.",
-                        pr_url,
-                        ReviewDomain::all().len()
-                    ),
-                });
+            // Special handling for General Polish phase (last phase)
+            if is_last_phase && use_github_reviews {
+                // GitHub mode: check for user comments and assess if work is complete
+                self.handle_general_polish_github(
+                    &current_prompt,
+                    timeout,
+                    work_sandbox,
+                    extracted_pr_number,
+                    &repo,
+                )
+                .await?;
             }
         }
 
+        // Determine final success
         let success = final_verdict
             .as_ref()
             .map(|v| *v == ReviewVerdict::Approved)
             .unwrap_or(false);
 
-        let summary = if success {
-            format!(
-                "Spawn-team completed successfully after {} iteration(s)",
-                iterations
-            )
-        } else if iterations >= self.config.max_iterations {
-            format!(
-                "Spawn-team reached max iterations ({}) without approval",
-                self.config.max_iterations
-            )
-        } else {
-            "Spawn-team completed with issues".to_string()
-        };
-
-        tracing::info!(
-            success = success,
-            iterations = iterations,
-            duration = ?start.elapsed(),
-            "spawn-team completed"
+        let summary = format!(
+            "Spawn-team completed. PR: {}. {} phases reviewed. Mode: {:?}",
+            pr_url.as_deref().unwrap_or("none"),
+            iterations,
+            self.config.mode
         );
 
         Ok(SpawnTeamResult {
@@ -507,6 +443,239 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             reviews,
             summary,
         })
+    }
+
+    /// Legacy sequential mode for backwards compatibility.
+    async fn run_sequential_mode(
+        &mut self,
+        prompt: &str,
+        timeout: Duration,
+        sandbox_path: &Path,
+        branch_name: Option<&str>,
+    ) -> Result<SpawnTeamResult> {
+        let mut reviews = Vec::new();
+
+        // Run primary
+        let primary_result = self
+            .run_primary(prompt, timeout, sandbox_path, 1, branch_name)
+            .await?;
+
+        if primary_result.status != SpawnStatus::Success {
+            return Ok(SpawnTeamResult {
+                success: false,
+                iterations: 1,
+                final_verdict: None,
+                reviews,
+                summary: format!("Primary LLM failed: {}", primary_result.summary),
+            });
+        }
+
+        // Get diff for review
+        let diff = self.get_git_diff(sandbox_path)?;
+
+        // Run reviewer
+        let review_result = self
+            .run_reviewer(prompt, &diff, timeout, sandbox_path, 1, None)
+            .await?;
+
+        let final_verdict = Some(review_result.verdict.clone());
+        reviews.push(review_result.clone());
+
+        // If needs changes, run fix phase
+        if review_result.verdict == ReviewVerdict::NeedsChanges {
+            let _fix_result = self
+                .run_fix(prompt, &review_result, timeout, sandbox_path, 1, branch_name)
+                .await?;
+        }
+
+        let success = final_verdict
+            .as_ref()
+            .map(|v| *v == ReviewVerdict::Approved)
+            .unwrap_or(false);
+
+        Ok(SpawnTeamResult {
+            success,
+            iterations: 1,
+            final_verdict,
+            reviews,
+            summary: "Sequential mode completed".to_string(),
+        })
+    }
+
+    /// Appends a review to the PR body (for PingPong mode traceability).
+    fn append_review_to_pr(
+        &self,
+        pr_url: &str,
+        review: &ReviewResult,
+        domain: &ReviewDomain,
+    ) -> Result<()> {
+        // Extract PR number from URL
+        let pr_number = self.extract_pr_number(pr_url)?;
+
+        // Get current PR body
+        let output = Command::new("gh")
+            .args(["pr", "view", &pr_number.to_string(), "--json", "body", "-q", ".body"])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to get PR body: {}", e)))?;
+
+        let current_body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Build review section
+        let verdict_emoji = match review.verdict {
+            ReviewVerdict::Approved => "✅",
+            ReviewVerdict::NeedsChanges => "🔄",
+            ReviewVerdict::Failed => "❌",
+        };
+
+        let mut review_section = format!(
+            "\n\n---\n## {} Review: {} {}\n\n**Summary:** {}\n",
+            verdict_emoji,
+            domain.as_str(),
+            verdict_emoji,
+            review.summary
+        );
+
+        if !review.suggestions.is_empty() {
+            review_section.push_str("\n### Suggestions\n\n");
+            for (i, suggestion) in review.suggestions.iter().enumerate() {
+                review_section.push_str(&format!(
+                    "{}. **{}**",
+                    i + 1,
+                    suggestion.file
+                ));
+                if let Some(line) = suggestion.line {
+                    review_section.push_str(&format!(" (line {})", line));
+                }
+                review_section.push_str(&format!(
+                    "\n   - Issue: {}\n   - Suggestion: {}\n\n",
+                    suggestion.issue, suggestion.suggestion
+                ));
+            }
+        }
+
+        // Update PR body
+        let new_body = format!("{}{}", current_body, review_section);
+        let edit_output = Command::new("gh")
+            .args(["pr", "edit", &pr_number.to_string(), "--body", &new_body])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to update PR body: {}", e)))?;
+
+        if !edit_output.status.success() {
+            tracing::warn!(
+                error = %String::from_utf8_lossy(&edit_output.stderr),
+                "failed to append review to PR body"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Handles the General Polish phase for GitHub mode.
+    ///
+    /// In this phase:
+    /// - Check if the planner did what was asked
+    /// - Look for any user comments and resolve them
+    /// - Re-open or create new comments as needed
+    async fn handle_general_polish_github(
+        &mut self,
+        prompt: &str,
+        timeout: Duration,
+        work_sandbox: &Path,
+        pr_number: u64,
+        repo: &str,
+    ) -> Result<()> {
+        tracing::info!(
+            pr_number = pr_number,
+            "GitHub mode: handling general polish - checking user comments"
+        );
+
+        // Get all comments on the PR (including user comments)
+        let comments_output = Command::new("gh")
+            .current_dir(work_sandbox)
+            .args([
+                "api",
+                &format!("repos/{}/pulls/{}/comments", repo, pr_number),
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to get PR comments: {}", e)))?;
+
+        if !comments_output.status.success() {
+            tracing::warn!(
+                error = %String::from_utf8_lossy(&comments_output.stderr),
+                "failed to get PR comments for general polish"
+            );
+            return Ok(());
+        }
+
+        // Parse comments to find user comments (not from bot/automation)
+        let comments_json = String::from_utf8_lossy(&comments_output.stdout);
+        if let Ok(comments) = serde_json::from_str::<Vec<serde_json::Value>>(&comments_json) {
+            let user_comments: Vec<_> = comments
+                .iter()
+                .filter(|c| {
+                    // Filter for unresolved user comments
+                    // Check if the comment is not from a bot and has no resolution
+                    let user_type = c.get("user")
+                        .and_then(|u| u.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("User");
+                    user_type == "User"
+                })
+                .collect();
+
+            if !user_comments.is_empty() {
+                tracing::info!(
+                    user_comments = user_comments.len(),
+                    "found user comments to address in general polish"
+                );
+
+                // Build prompt for coder to address user comments
+                for comment in user_comments {
+                    let comment_body = comment.get("body")
+                        .and_then(|b| b.as_str())
+                        .unwrap_or("");
+                    let comment_path = comment.get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("unknown");
+                    let comment_id = comment.get("id")
+                        .and_then(|id| id.as_u64())
+                        .unwrap_or(0);
+
+                    if comment_body.is_empty() {
+                        continue;
+                    }
+
+                    // Create a synthetic GitHubReviewComment for the resolver
+                    let user_comment = GitHubReviewComment {
+                        id: comment_id,
+                        path: comment_path.to_string(),
+                        line: comment.get("line").and_then(|l| l.as_u64()).map(|l| l as u32),
+                        body: comment_body.to_string(),
+                        resolved: false,
+                        resolved_by_commit: None,
+                    };
+
+                    tracing::info!(
+                        comment_id = comment_id,
+                        path = %comment_path,
+                        "resolving user comment in general polish"
+                    );
+
+                    // Resolve the user comment
+                    self.resolve_github_comment(
+                        prompt,
+                        timeout,
+                        work_sandbox,
+                        pr_number,
+                        repo,
+                        user_comment,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Runs the primary LLM (Claude).
@@ -560,15 +729,14 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 last_cmd.work_dir = sandbox.clone();
             }
 
-            // Commit and push changes after each LLM run for observability
-            if result.status == SpawnStatus::Success {
-                self.commit_and_push_changes(
-                    sandbox,
-                    iteration,
-                    &self.config.primary_llm.clone(),
-                    None,
-                );
-            }
+            // Commit and push changes even on partial completion (timeout)
+            // This preserves partial work that would otherwise be lost
+            self.commit_and_push_changes(
+                sandbox,
+                iteration,
+                &self.config.primary_llm.clone(),
+                None,
+            );
         }
 
         Ok(result)
@@ -613,6 +781,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Use --print with --verbose for stream-json output format
         let output = std::process::Command::new("claude")
             .current_dir(sandbox_path)
+            .envs(&self.env_vars)
             .args(["--print", "--verbose", "--output-format", "stream-json", prompt])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run claude: {}", e)))?;
@@ -710,6 +879,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Run Gemini directly (not through spawner - it's a reviewer, not making changes)
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
+            .envs(&self.env_vars)
             .args(["--print", &review_prompt])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
@@ -1004,6 +1174,48 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Checks if the current branch has commits different from the base branch.
+    ///
+    /// Returns true if there are commits that can be used to create a PR.
+    fn has_commits_on_branch(&self, sandbox_path: &Path) -> Result<bool> {
+        // Get default branch name
+        let default_branch = self.get_default_branch(sandbox_path)?;
+
+        // Get current branch
+        let branch_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .map_err(|e| Error::Git(format!("failed to get current branch: {}", e)))?;
+
+        let current_branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+
+        // Count commits between base and current branch
+        let count_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args([
+                "rev-list",
+                "--count",
+                &format!("{}..{}", default_branch, current_branch),
+            ])
+            .output()
+            .map_err(|e| Error::Git(format!("failed to count commits: {}", e)))?;
+
+        let count: u64 = String::from_utf8_lossy(&count_output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        tracing::info!(
+            default_branch = %default_branch,
+            current_branch = %current_branch,
+            commit_count = count,
+            "checked for commits on branch"
+        );
+
+        Ok(count > 0)
+    }
+
     /// Creates a PR on the first commit to the branch.
     fn create_pr_on_first_commit(
         &self,
@@ -1172,6 +1384,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Run Gemini directly - it will use gh commands to create the review
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
+            .envs(&self.env_vars)
             .args(["--print", &review_prompt])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
@@ -1227,7 +1440,11 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         Ok(review)
     }
 
-    /// Checks if new reviews were created on the PR.
+    /// Checks if new review comments were created on the PR.
+    ///
+    /// Looks for comments with review markers like `[SECURITY REVIEW - NEEDS CHANGES]`
+    /// or `[SECURITY REVIEW - APPROVED]` since we use comments instead of formal reviews
+    /// (GitHub doesn't allow the same user to submit request-changes reviews on own PRs).
     fn check_for_new_reviews(
         &self,
         pr_number: u64,
@@ -1241,12 +1458,12 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 "view",
                 &pr_number.to_string(),
                 "--json",
-                "reviews",
+                "comments",
                 "-q",
-                ".reviews | length",
+                ".comments | length",
             ])
             .output()
-            .map_err(|e| Error::Cruise(format!("failed to check reviews: {}", e)))?;
+            .map_err(|e| Error::Cruise(format!("failed to check comments: {}", e)))?;
 
         let count: u64 = String::from_utf8_lossy(&output.stdout)
             .trim()
@@ -1256,7 +1473,9 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         Ok(count > 0)
     }
 
-    /// Checks if the latest review requested changes.
+    /// Checks if the latest review comment indicates changes are needed.
+    ///
+    /// Looks for comments containing `[* REVIEW - NEEDS CHANGES]` marker.
     fn latest_review_requests_changes(
         &self,
         pr_number: u64,
@@ -1270,15 +1489,17 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 "view",
                 &pr_number.to_string(),
                 "--json",
-                "reviews",
+                "comments",
                 "-q",
-                ".reviews[-1].state",
+                ".comments[-1].body",
             ])
             .output()
-            .map_err(|e| Error::Cruise(format!("failed to check review state: {}", e)))?;
+            .map_err(|e| Error::Cruise(format!("failed to check comment body: {}", e)))?;
 
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(state == "CHANGES_REQUESTED")
+        let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Check if the comment contains a "NEEDS CHANGES" marker
+        Ok(body.contains("REVIEW - NEEDS CHANGES"))
     }
 
     /// Gets pending (unresolved) review comments from a PR.
@@ -1374,6 +1595,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Run Claude to resolve the comment
         let output = Command::new("claude")
             .current_dir(sandbox_path)
+            .envs(&self.env_vars)
             .args([
                 "--print",
                 "--verbose",

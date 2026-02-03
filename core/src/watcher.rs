@@ -175,8 +175,12 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                     });
                 }
                 Ok((progress, Some(timeout_reason))) => {
-                    // Timeout - cleanup sandbox
-                    sandbox.cleanup()?;
+                    // Timeout - preserve sandbox for partial work recovery
+                    // The caller can decide to commit and push any partial work
+                    let sandbox_path = sandbox.path().to_path_buf();
+
+                    // Prevent cleanup so partial work is preserved
+                    std::mem::forget(sandbox);
 
                     return Ok(WatcherResult {
                         success: false,
@@ -184,7 +188,7 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::Timeout(timeout_reason)),
-                        sandbox_path: None,
+                        sandbox_path: Some(sandbox_path),
                     });
                 }
                 Err(WatcherError::PermissionErrors(errors, progress)) => {

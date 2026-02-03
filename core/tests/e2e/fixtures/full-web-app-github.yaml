@@ -1,8 +1,8 @@
-name: full-web-app
-description: Full web application with SQLite, JWT auth, htmx frontend, and Rust backend (PingPong mode)
+name: full-web-app-github
+description: Full web application with SQLite, JWT auth, htmx frontend, and Rust backend (GitHub PR-based mode)
 runner: claude
 workflow: full
-team_mode: ping_pong
+team_mode: git_hub
 
 prompt: |
   Build a web application that allows users to edit an SQLite database.
@@ -47,4 +47,4 @@ validation:
   test_command: cargo test --lib
   e2e_command: cargo test --test e2e
 
-timeout: 600
+timeout: 1800  # 30 minutes for complex implementations
