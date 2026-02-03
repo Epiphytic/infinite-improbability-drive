@@ -1123,24 +1123,24 @@ You must implement the following task. There is a detailed plan available in the
             .filter(|r| r.status == TaskStatus::Completed)
             .count();
 
-        // Create implementation PR if successful
+        // Create implementation PR for partial work (even on timeout)
+        // This allows partial work to be reviewed and merged instead of being lost
         let mut impl_pr_url = None;
-        if team_result.success {
-            if let Some(ref sandbox) = sandbox_path {
-                impl_pr_url = self.create_implementation_pr_with_observability(
-                    sandbox,
-                    repo_path,
-                    prompt,
-                    &observability,
-                    team_result.iterations,
-                );
+        if let Some(ref sandbox) = sandbox_path {
+            impl_pr_url = self.create_implementation_pr_with_observability(
+                sandbox,
+                repo_path,
+                prompt,
+                &observability,
+                team_result.iterations,
+            );
 
-                // Auto-merge the implementation PR if auto_approve is enabled
-                if self.auto_approve {
-                    if let Some(ref pr_url) = impl_pr_url {
-                        if let Err(e) = self.auto_approve_pr(pr_url) {
-                            tracing::warn!(error = %e, "failed to auto-merge implementation PR");
-                        }
+            // Auto-merge the implementation PR if auto_approve is enabled
+            // This includes partial work from timeouts so E2E tests can validate content
+            if self.auto_approve {
+                if let Some(ref pr_url) = impl_pr_url {
+                    if let Err(e) = self.auto_approve_pr(pr_url) {
+                        tracing::warn!(error = %e, "failed to auto-merge implementation PR");
                     }
                 }
             }
