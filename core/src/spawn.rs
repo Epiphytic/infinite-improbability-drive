@@ -192,6 +192,19 @@ impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
         manifest: SandboxManifest,
         runner: Box<dyn LLMRunner>,
     ) -> Result<SpawnResult> {
+        self.spawn_with_branch(config, manifest, runner, None).await
+    }
+
+    /// Spawns a sandboxed LLM with an explicit branch name.
+    ///
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    pub async fn spawn_with_branch(
+        &self,
+        config: SpawnConfig,
+        manifest: SandboxManifest,
+        runner: Box<dyn LLMRunner>,
+        branch_name: Option<&str>,
+    ) -> Result<SpawnResult> {
         // Generate spawn ID
         let spawn_id = uuid::Uuid::new_v4().to_string();
 
@@ -237,8 +250,8 @@ impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
         // Create watcher agent
         let watcher = WatcherAgent::new(self.provider.clone(), runner, watcher_config);
 
-        // Run the watcher with potentially augmented prompt
-        let watcher_result = watcher.run(prompt, manifest).await?;
+        // Run the watcher with potentially augmented prompt and optional branch name
+        let watcher_result = watcher.run_with_branch(prompt, manifest, branch_name).await?;
 
         let duration = start_time.elapsed();
 

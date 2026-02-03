@@ -199,12 +199,20 @@ impl SandboxProvider for WorktreeSandbox {
 
     fn create(&self, manifest: SandboxManifest) -> Result<Self::Sandbox> {
         let branch_name = self.generate_branch_name();
-        let worktree_path = self.get_worktree_path(&branch_name)?;
+        self.create_with_branch(manifest, &branch_name)
+    }
+
+    fn create_with_branch(
+        &self,
+        manifest: SandboxManifest,
+        branch_name: &str,
+    ) -> Result<Self::Sandbox> {
+        let worktree_path = self.get_worktree_path(branch_name)?;
 
         // Create the worktree with a new branch (run from repo dir)
         let output = Command::new("git")
             .current_dir(&self.repo_path)
-            .args(["worktree", "add", "-b", &branch_name])
+            .args(["worktree", "add", "-b", branch_name])
             .arg(&worktree_path)
             .arg("HEAD")
             .output()?;
@@ -226,7 +234,7 @@ impl SandboxProvider for WorktreeSandbox {
         Ok(WorktreeSandboxInstance {
             path: worktree_path,
             repo_path: self.repo_path.clone(),
-            branch_name,
+            branch_name: branch_name.to_string(),
             manifest,
             cleaned_up: false,
         })

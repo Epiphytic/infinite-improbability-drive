@@ -22,7 +22,7 @@ use super::planner::generate_pr_body as generate_plan_pr_body;
 use super::result::{BuildResult, CruiseResult, PlanResult, TaskResult};
 use super::task::{CruisePlan, CruiseTask, TaskStatus};
 
-/// Sanitizes a string for use in filenames.
+/// Sanitizes a string for use in filenames and branch names.
 /// Converts to lowercase, replaces spaces with hyphens, removes special chars.
 fn sanitize_for_filename(s: &str) -> String {
     s.to_lowercase()
@@ -41,6 +41,45 @@ fn sanitize_for_filename(s: &str) -> String {
         .chars()
         .take(40) // Limit total length
         .collect()
+}
+
+/// Workflow phase for branch naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowPhase {
+    /// Planning phase: plan/feature-name-suffix
+    Plan,
+    /// Feature implementation: feat/feature-name-suffix
+    Feature,
+    /// Bug fix implementation: fix/bug-name-suffix
+    Fix,
+    /// Validation phase: validate/feature-name-suffix
+    Validate,
+}
+
+impl WorkflowPhase {
+    /// Returns the branch prefix for this phase.
+    fn prefix(&self) -> &'static str {
+        match self {
+            WorkflowPhase::Plan => "plan",
+            WorkflowPhase::Feature => "feat",
+            WorkflowPhase::Fix => "fix",
+            WorkflowPhase::Validate => "validate",
+        }
+    }
+}
+
+/// Generates a branch name for a workflow phase.
+/// Format: {prefix}/{feature-name}-{short-uuid}
+fn generate_branch_name(phase: WorkflowPhase, prompt: &str) -> String {
+    let feature_name = sanitize_for_filename(prompt);
+    let uuid = uuid::Uuid::new_v4();
+    let short_uuid = &uuid.to_string()[..8];
+
+    if feature_name.is_empty() {
+        format!("{}/task-{}", phase.prefix(), short_uuid)
+    } else {
+        format!("{}/{}-{}", phase.prefix(), feature_name, short_uuid)
+    }
 }
 
 /// Runner type for LLM selection.
@@ -438,6 +477,14 @@ Task to plan (do NOT implement): {prompt}"#,
     ) -> Result<(PlanResult, Vec<PlanIssue>)> {
         let start = Instant::now();
 
+        // Generate a consistent branch name for the planning phase
+        let branch_name = generate_branch_name(WorkflowPhase::Plan, original_prompt);
+
+        tracing::info!(
+            branch = %branch_name,
+            "starting planning phase"
+        );
+
         // Configure spawn-team for planning
         let team_config = SpawnTeamConfig {
             mode: CoordinationMode::PingPong,
@@ -452,11 +499,10 @@ Task to plan (do NOT implement): {prompt}"#,
         )
         .with_config(team_config);
 
-        // Run the orchestrator
-        // Note: The orchestrator creates its own sandboxes internally.
-        // We use repo_path for reference operations like beads issue creation.
+        // Run the orchestrator with the explicit branch name
+        // All iterations use the same branch for consistency
         let team_result = orchestrator
-            .run(planning_prompt, timeout, repo_path)
+            .run_with_branch(planning_prompt, timeout, repo_path, Some(&branch_name))
             .await?;
 
         // Get observability data from orchestrator
@@ -540,12 +586,20 @@ Task to plan (do NOT implement): {prompt}"#,
     ) -> Result<(PlanResult, Vec<PlanIssue>)> {
         let start = Instant::now();
 
+        // Generate a consistent branch name for the planning phase
+        let branch_name = generate_branch_name(WorkflowPhase::Plan, original_prompt);
+
+        tracing::info!(
+            branch = %branch_name,
+            "starting simple planning phase"
+        );
+
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("planning"));
         let config = SpawnConfig::new(planning_prompt).with_total_timeout(timeout);
         let manifest = SandboxManifest::default();
         let runner = ClaudeRunner::new();
 
-        let spawn_result = spawner.spawn(config, manifest, Box::new(runner)).await?;
+        let spawn_result = spawner.spawn_with_branch(config, manifest, Box::new(runner), Some(&branch_name)).await?;
         let success = spawn_result.status == SpawnStatus::Success;
 
         let mut plan_issues = Vec::new();
@@ -901,6 +955,14 @@ Task to plan (do NOT implement): {prompt}"#,
     ) -> Result<BuildResult> {
         let start = Instant::now();
 
+        // Generate a consistent branch name for the feature implementation phase
+        let branch_name = generate_branch_name(WorkflowPhase::Feature, prompt);
+
+        tracing::info!(
+            branch = %branch_name,
+            "starting execution phase"
+        );
+
         // Configure spawn-team for execution
         let team_config = SpawnTeamConfig {
             mode: CoordinationMode::PingPong,
@@ -915,8 +977,8 @@ Task to plan (do NOT implement): {prompt}"#,
         )
         .with_config(team_config);
 
-        // Run the orchestrator
-        let team_result = orchestrator.run(prompt, timeout, repo_path).await?;
+        // Run the orchestrator with the explicit branch name
+        let team_result = orchestrator.run_with_branch(prompt, timeout, repo_path, Some(&branch_name)).await?;
 
         // Get observability data from orchestrator
         let observability = orchestrator.take_observability();
@@ -988,12 +1050,20 @@ Task to plan (do NOT implement): {prompt}"#,
     ) -> Result<BuildResult> {
         let start = Instant::now();
 
+        // Generate a consistent branch name for the feature implementation phase
+        let branch_name = generate_branch_name(WorkflowPhase::Feature, prompt);
+
+        tracing::info!(
+            branch = %branch_name,
+            "starting simple execution phase"
+        );
+
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("execution"));
         let config = SpawnConfig::new(prompt).with_total_timeout(timeout);
         let manifest = SandboxManifest::default();
         let runner = ClaudeRunner::new();
 
-        let spawn_result = spawner.spawn(config, manifest, Box::new(runner)).await?;
+        let spawn_result = spawner.spawn_with_branch(config, manifest, Box::new(runner), Some(&branch_name)).await?;
         let success = spawn_result.status == SpawnStatus::Success;
 
         // Close beads issues and create individual commits

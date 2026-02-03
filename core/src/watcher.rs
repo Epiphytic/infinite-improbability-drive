@@ -129,14 +129,29 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         prompt: String,
         initial_manifest: SandboxManifest,
     ) -> Result<WatcherResult> {
+        self.run_with_branch(prompt, initial_manifest, None).await
+    }
+
+    /// Runs a spawn with an explicit branch name.
+    ///
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    pub async fn run_with_branch(
+        &self,
+        prompt: String,
+        initial_manifest: SandboxManifest,
+        branch_name: Option<&str>,
+    ) -> Result<WatcherResult> {
         let mut manifest = initial_manifest;
         let mut permission_errors = Vec::new();
         let mut applied_fixes = Vec::new();
         let mut escalation_count = 0;
 
         loop {
-            // Create sandbox
-            let mut sandbox = self.provider.create(manifest.clone())?;
+            // Create sandbox with optional explicit branch name
+            let mut sandbox = match branch_name {
+                Some(name) => self.provider.create_with_branch(manifest.clone(), name)?,
+                None => self.provider.create(manifest.clone())?,
+            };
             let sandbox_path = sandbox.path().clone();
 
             // Run LLM with monitoring

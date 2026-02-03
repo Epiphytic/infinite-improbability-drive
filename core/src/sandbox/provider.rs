@@ -71,7 +71,16 @@ pub trait SandboxProvider: Send + Sync {
     type Sandbox: Sandbox;
 
     /// Creates a new sandbox with the given manifest.
+    /// Uses auto-generated branch name.
     fn create(&self, manifest: SandboxManifest) -> Result<Self::Sandbox>;
+
+    /// Creates a new sandbox with an explicit branch name.
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    fn create_with_branch(
+        &self,
+        manifest: SandboxManifest,
+        branch_name: &str,
+    ) -> Result<Self::Sandbox>;
 
     /// Returns the path to the repository root.
     ///

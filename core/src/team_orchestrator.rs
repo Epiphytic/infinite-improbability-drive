@@ -161,6 +161,19 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         timeout: Duration,
         sandbox_path: &Path,
     ) -> Result<SpawnTeamResult> {
+        self.run_with_branch(prompt, timeout, sandbox_path, None).await
+    }
+
+    /// Runs the spawn-team workflow with an explicit branch name.
+    ///
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    pub async fn run_with_branch(
+        &mut self,
+        prompt: &str,
+        timeout: Duration,
+        sandbox_path: &Path,
+        branch_name: Option<&str>,
+    ) -> Result<SpawnTeamResult> {
         let start = Instant::now();
         let mut iterations = 0;
         let mut reviews = Vec::new();
@@ -173,7 +186,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
                 // Run primary
                 let primary_result = self
-                    .run_primary(prompt, timeout, sandbox_path, iterations)
+                    .run_primary(prompt, timeout, sandbox_path, iterations, branch_name)
                     .await?;
 
                 if primary_result.status != SpawnStatus::Success {
@@ -200,7 +213,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 // If needs changes, run fix phase
                 if review_result.verdict == ReviewVerdict::NeedsChanges {
                     let _fix_result = self
-                        .run_fix(prompt, &review_result, timeout, sandbox_path, iterations)
+                        .run_fix(prompt, &review_result, timeout, sandbox_path, iterations, branch_name)
                         .await?;
                 }
             }
@@ -216,14 +229,10 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                     iterations = i;
 
                     // Run primary (or fix if not first iteration)
-                    let primary_result = if i == 1 {
-                        self.run_primary(&current_prompt, timeout, sandbox_path, i)
-                            .await?
-                    } else {
-                        // For subsequent iterations, we continue with the fix prompt
-                        self.run_primary(&current_prompt, timeout, sandbox_path, i)
-                            .await?
-                    };
+                    // All iterations use the same branch for consistency
+                    let primary_result = self
+                        .run_primary(&current_prompt, timeout, sandbox_path, i, branch_name)
+                        .await?;
 
                     if primary_result.status != SpawnStatus::Success {
                         return Ok(SpawnTeamResult {
@@ -332,6 +341,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         timeout: Duration,
         sandbox_path: &Path,
         iteration: u32,
+        branch_name: Option<&str>,
     ) -> Result<SpawnResult> {
         let runner = ClaudeRunner::new();
 
@@ -361,10 +371,11 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         tracing::info!(
             iteration = iteration,
             llm = %self.config.primary_llm,
+            branch = ?branch_name,
             "running primary LLM"
         );
 
-        let result = spawner.spawn(config, manifest, Box::new(runner)).await?;
+        let result = spawner.spawn_with_branch(config, manifest, Box::new(runner), branch_name).await?;
 
         // Capture the actual sandbox path where work was done
         if let Some(ref sandbox) = result.sandbox_path {
@@ -492,12 +503,13 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         timeout: Duration,
         sandbox_path: &Path,
         iteration: u32,
+        branch_name: Option<&str>,
     ) -> Result<SpawnResult> {
         let fix_prompt = FixPromptBuilder::new(original_prompt)
             .with_suggestions(review.suggestions.clone())
             .build();
 
-        self.run_primary(&fix_prompt, timeout, sandbox_path, iteration)
+        self.run_primary(&fix_prompt, timeout, sandbox_path, iteration, branch_name)
             .await
     }
 
