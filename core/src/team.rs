@@ -37,6 +37,9 @@ pub struct SpawnTeamConfig {
     /// Reviewer LLM identifier (e.g., "gemini-cli").
     #[serde(default = "default_reviewer_llm")]
     pub reviewer_llm: String,
+    /// Maximum permission escalations allowed per spawn.
+    #[serde(default = "default_max_escalations")]
+    pub max_escalations: u32,
 }
 
 fn default_max_iterations() -> u32 {
@@ -51,6 +54,10 @@ fn default_reviewer_llm() -> String {
     "gemini-cli".to_string()
 }
 
+fn default_max_escalations() -> u32 {
+    5 // Allow 5 escalations for complex tasks
+}
+
 impl Default for SpawnTeamConfig {
     fn default() -> Self {
         Self {
@@ -58,6 +65,7 @@ impl Default for SpawnTeamConfig {
             max_iterations: default_max_iterations(),
             primary_llm: default_primary_llm(),
             reviewer_llm: default_reviewer_llm(),
+            max_escalations: default_max_escalations(),
         }
     }
 }
@@ -583,6 +591,7 @@ mod tests {
         assert_eq!(config.max_iterations, 3);
         assert_eq!(config.primary_llm, "claude-code");
         assert_eq!(config.reviewer_llm, "gemini-cli");
+        assert_eq!(config.max_escalations, 5);
     }
 
     #[test]

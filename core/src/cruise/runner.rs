@@ -128,6 +128,8 @@ pub struct CruiseRunner<P: SandboxProvider + Clone> {
     team_mode: crate::team::CoordinationMode,
     /// Environment variables to pass to LLM processes
     env_vars: std::collections::HashMap<String, String>,
+    /// Maximum permission escalations allowed per spawn (default: 1)
+    max_escalations: u32,
 }
 
 impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
@@ -145,7 +147,17 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             use_spawn_team: false,
             team_mode: crate::team::CoordinationMode::default(),
             env_vars,
+            max_escalations: 5, // Allow 5 escalations for complex tasks
         }
+    }
+
+    /// Sets the maximum permission escalations allowed per spawn.
+    ///
+    /// For complex tasks that need multiple tool permissions (e.g., web apps
+    /// with auth, databases, and tests), increase this value.
+    pub fn with_max_escalations(mut self, max: u32) -> Self {
+        self.max_escalations = max;
+        self
     }
 
     /// Enables spawn-team mode with Gemini reviews.
@@ -196,7 +208,9 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         let start = Instant::now();
 
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.clone());
-        let config = SpawnConfig::new(prompt).with_total_timeout(timeout);
+        let config = SpawnConfig::new(prompt)
+            .with_total_timeout(timeout)
+            .with_max_escalations(self.max_escalations);
         let manifest = SandboxManifest::default();
         let runner = runner_type.create_runner();
 
@@ -606,6 +620,7 @@ You must implement the following task. There is a detailed plan available in the
             max_iterations: self.config.planning.ping_pong_iterations,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
+            max_escalations: self.max_escalations,
         };
 
         let mut orchestrator = SpawnTeamOrchestrator::new(
@@ -713,7 +728,9 @@ You must implement the following task. There is a detailed plan available in the
         );
 
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("planning"));
-        let config = SpawnConfig::new(planning_prompt).with_total_timeout(timeout);
+        let config = SpawnConfig::new(planning_prompt)
+            .with_total_timeout(timeout)
+            .with_max_escalations(self.max_escalations);
         let manifest = SandboxManifest::default();
         let runner = ClaudeRunner::new();
 
@@ -1087,6 +1104,7 @@ You must implement the following task. There is a detailed plan available in the
             max_iterations: self.config.planning.ping_pong_iterations, // Reuse planning iterations
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
+            max_escalations: self.max_escalations,
         };
 
         let mut orchestrator = SpawnTeamOrchestrator::new(
@@ -1189,7 +1207,9 @@ You must implement the following task. There is a detailed plan available in the
         );
 
         let spawner = Spawner::new(self.provider.clone(), self.logs_dir.join("execution"));
-        let config = SpawnConfig::new(prompt).with_total_timeout(timeout);
+        let config = SpawnConfig::new(prompt)
+            .with_total_timeout(timeout)
+            .with_max_escalations(self.max_escalations);
         let manifest = SandboxManifest::default();
         let runner = ClaudeRunner::new();
 

@@ -89,6 +89,19 @@ impl SpawnConfig {
         self.total_timeout = timeout;
         self
     }
+
+    /// Sets the maximum permission escalations allowed.
+    ///
+    /// Each time the watcher detects a permission error and applies a fix,
+    /// it counts as an escalation. Once this limit is reached, the spawn
+    /// is terminated. Default is 1.
+    ///
+    /// For complex tasks that may need multiple tool permissions, increase
+    /// this value (e.g., 5 for full-stack applications).
+    pub fn with_max_escalations(mut self, max: u32) -> Self {
+        self.max_permission_escalations = max;
+        self
+    }
 }
 
 impl From<&SpawnConfig> for WatcherConfig {

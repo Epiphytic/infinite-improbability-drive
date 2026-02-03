@@ -165,9 +165,10 @@ impl E2EHarness {
         let provider = WorktreeSandbox::new(repo.path().clone(), None);
         let spawner = Spawner::new(provider, logs_dir);
 
-        // Configure spawn
+        // Configure spawn with higher escalation limit for complex E2E tasks
         let config = SpawnConfig::new(&fixture.prompt)
-            .with_total_timeout(Duration::from_secs(fixture.timeout));
+            .with_total_timeout(Duration::from_secs(fixture.timeout))
+            .with_max_escalations(5);
 
         let manifest = crate::SandboxManifest::default();
 
@@ -520,7 +521,9 @@ impl E2EHarness {
         let provider = WorktreeSandbox::new(repo.path().clone(), None);
         let spawner = Spawner::new(provider, logs_dir);
 
-        let config = SpawnConfig::new(prompt).with_total_timeout(Duration::from_secs(timeout));
+        let config = SpawnConfig::new(prompt)
+            .with_total_timeout(Duration::from_secs(timeout))
+            .with_max_escalations(5);
 
         let manifest = crate::SandboxManifest::default();
 

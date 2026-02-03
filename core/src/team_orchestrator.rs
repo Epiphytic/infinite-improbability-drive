@@ -709,7 +709,9 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             self.logs_dir.join(format!("primary-{}", iteration)),
         );
 
-        let config = SpawnConfig::new(prompt).with_total_timeout(timeout);
+        let config = SpawnConfig::new(prompt)
+            .with_total_timeout(timeout)
+            .with_max_escalations(self.config.max_escalations);
         let manifest = SandboxManifest::default();
 
         tracing::info!(

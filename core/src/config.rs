@@ -416,6 +416,7 @@ mod tests {
             max_iterations: 0,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
+            max_escalations: 5,
         };
         let result = config.validate();
         assert!(!result.is_valid());
@@ -429,6 +430,7 @@ mod tests {
             max_iterations: 20,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
+            max_escalations: 5,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -442,6 +444,7 @@ mod tests {
             max_iterations: 3,
             primary_llm: "unknown-llm".to_string(),
             reviewer_llm: "gemini-cli".to_string(),
+            max_escalations: 5,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -455,6 +458,7 @@ mod tests {
             max_iterations: 3,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "gpt-4".to_string(),
+            max_escalations: 5,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -468,6 +472,7 @@ mod tests {
             max_iterations: 3,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "claude-code".to_string(),
+            max_escalations: 5,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -500,6 +505,7 @@ mod tests {
             max_iterations: 3,
             primary_llm: "claude-code".to_string(),
             reviewer_llm: "claude-code".to_string(), // Same - should warn
+            max_escalations: 5,
         };
 
         let result = validate_spawn_team_operation(&config, &manifest, &team_config);

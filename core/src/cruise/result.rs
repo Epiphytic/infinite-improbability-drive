@@ -260,6 +260,7 @@ mod tests {
     fn build_result_success_rate() {
         let result = BuildResult {
             success: true,
+            summary: "Test completed".to_string(),
             task_results: vec![
                 TaskResult {
                     task_id: "1".to_string(),
@@ -290,6 +291,7 @@ mod tests {
     fn build_result_success_rate_empty() {
         let result = BuildResult {
             success: true,
+            summary: "Empty test".to_string(),
             task_results: vec![],
             max_parallelism: 0,
             duration: Duration::from_secs(0),
