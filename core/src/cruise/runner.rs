@@ -1138,18 +1138,23 @@ You must implement the following task. There is a detailed plan available in the
                 &observability,
                 team_result.iterations,
             );
+        }
 
-            // Auto-merge the implementation PR if auto_approve is enabled
-            // This includes partial work from timeouts so E2E tests can validate content
-            if self.auto_approve {
-                if let Some(ref pr_url) = impl_pr_url {
-                    if let Err(e) = self.auto_approve_pr(pr_url) {
-                        tracing::warn!(error = %e, "failed to auto-merge implementation PR");
-                    } else {
-                        // Sync local repo with merged changes for validation
-                        self.sync_with_remote(repo_path);
-                    }
+        // Use PR URL from observability as fallback (orchestrator may have already created it)
+        let pr_url_to_merge = impl_pr_url.or_else(|| observability.pr_url.clone());
+
+        // Auto-merge the implementation PR if auto_approve is enabled
+        // This includes partial work from timeouts so E2E tests can validate content
+        if self.auto_approve {
+            if let Some(ref pr_url) = pr_url_to_merge {
+                if let Err(e) = self.auto_approve_pr(pr_url) {
+                    tracing::warn!(error = %e, "failed to auto-merge implementation PR");
+                } else {
+                    // Sync local repo with merged changes for validation
+                    self.sync_with_remote(repo_path);
                 }
+            } else {
+                tracing::warn!("no implementation PR URL available to auto-merge");
             }
         }
 
