@@ -1384,12 +1384,12 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         // Run Gemini with proper CLI arguments to execute the review
-        // Using --yolo for auto-approval and --prompt to pass the review prompt
+        // Using --approval-mode plan for safe execution with auto-approved plans
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
             .args([
-                "--yolo",                    // Auto-approve tool use
+                "--approval-mode", "plan",   // Auto-approve planned actions
                 "--prompt", &review_prompt,  // The review instructions
             ])
             .output()
