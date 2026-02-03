@@ -505,10 +505,8 @@ impl ResolveCommentPromptBuilder {
         let mut prompt = String::new();
 
         prompt.push_str("## Resolve GitHub Review Comment\n\n");
-
-        prompt.push_str("### Original Task Context\n\n");
-        prompt.push_str(&self.original_prompt);
-        prompt.push_str("\n\n");
+        prompt.push_str("A reviewer has left feedback on a plan file. ");
+        prompt.push_str("Your task is to EDIT the plan file to address their feedback.\n\n");
 
         prompt.push_str("### Review Comment to Address\n\n");
         prompt.push_str(&format!("**File:** `{}`\n", self.comment.path));
@@ -519,14 +517,17 @@ impl ResolveCommentPromptBuilder {
         prompt.push_str(&format!("**Feedback:**\n{}\n\n", self.comment.body));
 
         prompt.push_str("### Instructions\n\n");
-        prompt.push_str("1. Address the review comment by making the necessary code changes.\n");
-        prompt.push_str("2. Commit your changes with a message referencing the comment.\n");
+        prompt.push_str("**You MUST perform these actions:**\n\n");
         prompt.push_str(&format!(
-            "3. After committing, reply to the comment using:\n   ```bash\n   gh pr comment {} --repo {} --body \"Fixed in commit <hash>: <brief explanation>\"\n   ```\n\n",
-            self.pr_number, self.repo
+            "1. Use the Read tool to read the file: `{}`\n",
+            self.comment.path
+        ));
+        prompt.push_str(&format!(
+            "2. Use the Edit tool to modify `{}` to address the reviewer's feedback\n\n",
+            self.comment.path
         ));
         prompt.push_str(
-            "If you believe the comment should NOT be addressed, explain why in a reply instead.\n",
+            "The commit and reply will be handled automatically after you make the edits.\n",
         );
 
         prompt

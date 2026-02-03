@@ -262,11 +262,17 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             active_sandbox_path = Some(path.clone());
         }
 
-        // IMPORTANT: Use the original repo path for PR operations, not the sandbox path.
-        // The sandbox worktree is cleaned up when spawn_with_branch returns, but the
-        // branch has already been pushed to origin. We can operate on the pushed branch
-        // from the original repo.
+        // IMPORTANT: We have two paths with different purposes:
+        // - work_path (original repo): Used for PR operations via `gh` CLI and branch checking
+        //   since these operate on remote refs and don't need local checkout
+        // - worktree_path: Used for operations that modify files and commit,
+        //   since it has the feature branch checked out
         let work_path = sandbox_path;
+
+        // The worktree path is needed for operations that commit to the feature branch
+        // Create a longer-lived binding if we need to use the sandbox_path as fallback
+        let fallback_path = sandbox_path.to_path_buf();
+        let worktree_path = active_sandbox_path.as_ref().unwrap_or(&fallback_path);
 
         // Step 2: CREATE PR ON FIRST COMMIT (shared by both modes)
         // First, verify there are commits to create a PR for
@@ -314,8 +320,8 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 "starting review phase"
             );
 
-            // Get current diff for this phase
-            let diff = self.get_git_diff(work_path)?;
+            // Get current diff for this phase - use worktree where feature branch is checked out
+            let diff = self.get_git_diff(worktree_path)?;
 
             // Run review - method differs based on mode
             let review_result = if use_github_reviews {
@@ -324,7 +330,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                     &current_prompt,
                     &diff,
                     timeout,
-                    work_path,
+                    worktree_path,
                     *domain,
                     extracted_pr_number,
                     &repo,
@@ -332,12 +338,13 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 .await?
             } else {
                 // PingPong mode: reviewer outputs to stdout
+                // Use worktree_path where feature branch files are available
                 let review = self
                     .run_reviewer(
                         &current_prompt,
                         &diff,
                         timeout,
-                        work_path,
+                        worktree_path,
                         iterations,
                         Some(domain.as_str()),
                     )
@@ -370,31 +377,44 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                         work_path,
                     )?;
 
-                    for comment in pending_comments {
-                        tracing::info!(
-                            comment_id = comment.id,
-                            path = %comment.path,
-                            "resolving GitHub review comment"
+                    if pending_comments.is_empty() {
+                        // Reviewer said NEEDS CHANGES but didn't post line-specific comments.
+                        // This means the feedback is general (in the PR comment body).
+                        // We'll continue to the next review phase since we can't auto-fix
+                        // without specific file/line guidance.
+                        tracing::warn!(
+                            domain = %domain.as_str(),
+                            "reviewer requested changes but no line-specific comments found - continuing to next phase"
                         );
+                    } else {
+                        for comment in pending_comments {
+                            tracing::info!(
+                                comment_id = comment.id,
+                                path = %comment.path,
+                                "resolving GitHub review comment"
+                            );
 
-                        self.resolve_github_comment(
-                            &current_prompt,
-                            timeout,
-                            work_path,
-                            extracted_pr_number,
-                            &repo,
-                            comment,
-                        )
-                        .await?;
+                            // Use worktree_path for commits to go to the feature branch
+                            self.resolve_github_comment(
+                                &current_prompt,
+                                timeout,
+                                worktree_path,
+                                extracted_pr_number,
+                                &repo,
+                                comment,
+                            )
+                            .await?;
+                        }
                     }
                 } else {
                     // PingPong mode: run fix phase
+                    // Use worktree_path for commits to go to the feature branch
                     let _fix_result = self
                         .run_fix(
                             &current_prompt,
                             &review_result,
                             timeout,
-                            work_path,
+                            worktree_path,
                             iterations,
                             None, // Use existing branch
                         )
@@ -415,10 +435,11 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             // Special handling for General Polish phase (last phase)
             if is_last_phase && use_github_reviews {
                 // GitHub mode: check for user comments and assess if work is complete
+                // IMPORTANT: Use worktree_path (not work_path) so commits go to the PR branch
                 self.handle_general_polish_github(
                     &current_prompt,
                     timeout,
-                    work_path,
+                    worktree_path,
                     extracted_pr_number,
                     &repo,
                 )
@@ -583,7 +604,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         &mut self,
         prompt: &str,
         timeout: Duration,
-        work_path: &Path,
+        worktree_path: &Path,
         pr_number: u64,
         repo: &str,
     ) -> Result<()> {
@@ -593,8 +614,9 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         // Get all comments on the PR (including user comments)
+        // Note: gh CLI works from any directory, but we use worktree for consistency
         let comments_output = Command::new("gh")
-            .current_dir(work_path)
+            .current_dir(worktree_path)
             .args([
                 "api",
                 &format!("repos/{}/pulls/{}/comments", repo, pr_number),
@@ -664,11 +686,11 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                         "resolving user comment in general polish"
                     );
 
-                    // Resolve the user comment
+                    // Resolve the user comment using worktree_path so commits go to PR branch
                     self.resolve_github_comment(
                         prompt,
                         timeout,
-                        work_path,
+                        worktree_path,
                         pr_number,
                         repo,
                         user_comment,
@@ -785,10 +807,11 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Run the LLM directly using Command instead of spawning a new sandbox
         // Use --print with --verbose for stream-json output format
         // IMPORTANT: -p flag is required for --print mode
+        // IMPORTANT: --permission-mode acceptEdits allows Claude to make file edits
         let output = std::process::Command::new("claude")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
-            .args(["--print", "--verbose", "--output-format", "stream-json", "-p", prompt])
+            .args(["--print", "--verbose", "--output-format", "stream-json", "--permission-mode", "acceptEdits", "-p", prompt])
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run claude: {}", e)))?;
 
@@ -1100,9 +1123,22 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             .output()
             .ok();
 
-        let pushed = push_output
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let pushed = match &push_output {
+            Some(output) => {
+                if !output.status.success() {
+                    tracing::error!(
+                        branch = %branch,
+                        stderr = %String::from_utf8_lossy(&output.stderr),
+                        "git push failed"
+                    );
+                }
+                output.status.success()
+            }
+            None => {
+                tracing::error!("git push command failed to execute");
+                false
+            }
+        };
 
         // Record commit
         self.observability.commits.push(CommitRecord {
@@ -1207,24 +1243,32 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             .map_err(|e| Error::Git(format!("failed to list remote branches: {}", e)))?;
 
         let branches_str = String::from_utf8_lossy(&branch_output.stdout);
-        let feature_branch = branches_str
+
+        // Find work branches (feat/, feature/, plan/, etc.) - anything that's not the default branch
+        let work_branch = branches_str
             .lines()
             .map(|s| s.trim())
-            .find(|b| b.starts_with("origin/feat") || b.starts_with("origin/feature"))
+            .find(|b| {
+                let stripped = b.trim_start_matches("origin/");
+                stripped.starts_with("feat") ||
+                stripped.starts_with("feature") ||
+                stripped.starts_with("plan") ||
+                stripped.starts_with("impl")
+            })
             .map(|s| s.to_string());
 
-        let Some(feature_branch) = feature_branch else {
-            tracing::warn!("no feature branch found on remote");
+        let Some(work_branch) = work_branch else {
+            tracing::warn!("no work branch found on remote");
             return Ok(false);
         };
 
-        // Count commits between default and feature branch
+        // Count commits between default and work branch
         let count_output = Command::new("git")
             .current_dir(repo_path)
             .args([
                 "rev-list",
                 "--count",
-                &format!("origin/{}..{}", default_branch, feature_branch),
+                &format!("origin/{}..{}", default_branch, work_branch),
             ])
             .output()
             .map_err(|e| Error::Git(format!("failed to count commits: {}", e)))?;
@@ -1236,7 +1280,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         tracing::info!(
             default_branch = %default_branch,
-            feature_branch = %feature_branch,
+            work_branch = %work_branch,
             commit_count = count,
             "checked for commits on branch"
         );
@@ -1263,7 +1307,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             .args(["fetch", "origin"])
             .output();
 
-        // Find the feature branch from remote refs
+        // Find the work branch from remote refs (feat/, feature/, plan/, impl/)
         let branch_output = Command::new("git")
             .current_dir(repo_path)
             .args(["branch", "-r", "--list", "origin/*"])
@@ -1271,20 +1315,26 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             .map_err(|e| Error::Git(format!("failed to list remote branches: {}", e)))?;
 
         let branches_str = String::from_utf8_lossy(&branch_output.stdout);
-        let feature_branch = branches_str
+        let work_branch = branches_str
             .lines()
             .map(|s| s.trim())
-            .find(|b| b.starts_with("origin/feat") || b.starts_with("origin/feature"))
+            .find(|b| {
+                let stripped = b.trim_start_matches("origin/");
+                stripped.starts_with("feat") ||
+                stripped.starts_with("feature") ||
+                stripped.starts_with("plan") ||
+                stripped.starts_with("impl")
+            })
             .map(|s| s.trim_start_matches("origin/").to_string());
 
-        let Some(branch) = feature_branch else {
-            return Err(Error::Git("no feature branch found on remote".to_string()));
+        let Some(branch) = work_branch else {
+            return Err(Error::Git("no work branch found on remote".to_string()));
         };
 
         tracing::info!(
             branch = %branch,
             default_branch = %default_branch,
-            "creating PR from remote feature branch"
+            "creating PR from remote work branch"
         );
 
         // Create PR title from prompt (truncate if needed)
@@ -1677,6 +1727,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Run Claude to resolve the comment
         // IMPORTANT: -p flag is required for --print mode
+        // IMPORTANT: --permission-mode acceptEdits allows Claude to make file edits
         let output = Command::new("claude")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
@@ -1685,6 +1736,8 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
                 "--verbose",
                 "--output-format",
                 "stream-json",
+                "--permission-mode",
+                "acceptEdits",
                 "-p",
                 &resolve_prompt,
             ])
