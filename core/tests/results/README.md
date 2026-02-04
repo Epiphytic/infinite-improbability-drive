@@ -8,6 +8,7 @@ This directory contains automated E2E test results for infinite-improbability-dr
 |------|--------|------|------|
 | full_web_app | ❌ FAILED | 2026-02-03 | [View](full_web_app-latest.md) |
 | full_web_app_github | ❌ FAILED | 2026-02-03 | [View](full_web_app_github-latest.md) |
+| simple_github | ✅ PASSED | 2026-02-04 | [View](simple_github-latest.md) |
 
 ## Test Descriptions
 
@@ -16,7 +17,8 @@ This directory contains automated E2E test results for infinite-improbability-dr
 | `smoke_hello` | Basic smoke test - create simple file |
 | `code_generation` | Generate Rust code with tests |
 | `full_web_app` | Full workflow with PingPong mode |
-| `full_web_app_github` | Full workflow with GitHub PR-based reviews |
+| `full_web_app_github` | Full workflow with GitHub PR-based reviews (complex) |
+| `simple_github` | GitHub PR-based reviews with simple task (fast) |
 | `full_workflow_simple` | Full plan→approve→execute workflow |
 | `smoke_hello_gemini` | Smoke test using Gemini instead of Claude |
 

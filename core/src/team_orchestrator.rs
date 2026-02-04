@@ -1042,6 +1042,8 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
     /// Commits and pushes changes made by the LLM.
     /// This improves observability by creating a commit for each LLM iteration.
+    /// IMPORTANT: Always pushes if there are local commits ahead of remote,
+    /// even if Claude already committed the changes itself.
     fn commit_and_push_changes(
         &mut self,
         sandbox_path: &Path,
@@ -1049,66 +1051,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         llm: &str,
         phase: Option<&str>,
     ) -> Option<String> {
-        // Check if there are changes to commit
-        let status_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["status", "--porcelain"])
-            .output()
-            .ok()?;
-
-        let status = String::from_utf8_lossy(&status_output.stdout);
-        if status.trim().is_empty() {
-            tracing::debug!(iteration = iteration, "no changes to commit");
-            return None;
-        }
-
-        // Stage all changes
-        let add_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["add", "-A"])
-            .output()
-            .ok()?;
-
-        if !add_output.status.success() {
-            tracing::warn!(
-                error = %String::from_utf8_lossy(&add_output.stderr),
-                "failed to stage changes"
-            );
-            return None;
-        }
-
-        // Create commit message
-        let phase_str = phase.map(|p| format!(" - {}", p)).unwrap_or_default();
-        let commit_message = format!(
-            "[cruise-control] {} iteration {}{}",
-            llm, iteration, phase_str
-        );
-
-        // Commit changes
-        let commit_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["commit", "-m", &commit_message])
-            .output()
-            .ok()?;
-
-        if !commit_output.status.success() {
-            tracing::warn!(
-                error = %String::from_utf8_lossy(&commit_output.stderr),
-                "failed to commit changes"
-            );
-            return None;
-        }
-
-        // Get commit hash
-        let hash_output = Command::new("git")
-            .current_dir(sandbox_path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()?;
-
-        let hash = String::from_utf8_lossy(&hash_output.stdout).trim().to_string();
-
-        // Push to remote
+        // Get branch name first - needed for both commit and push
         let branch_output = Command::new("git")
             .current_dir(sandbox_path)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1116,6 +1059,115 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             .ok()?;
 
         let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+
+        // Check if there are uncommitted changes to commit
+        let status_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()?;
+
+        let status = String::from_utf8_lossy(&status_output.stdout);
+        let has_uncommitted = !status.trim().is_empty();
+
+        let hash = if has_uncommitted {
+            // Stage all changes
+            let add_output = Command::new("git")
+                .current_dir(sandbox_path)
+                .args(["add", "-A"])
+                .output()
+                .ok()?;
+
+            if !add_output.status.success() {
+                tracing::warn!(
+                    error = %String::from_utf8_lossy(&add_output.stderr),
+                    "failed to stage changes"
+                );
+                // Continue to push check even if staging fails
+            } else {
+                // Create commit message
+                let phase_str = phase.map(|p| format!(" - {}", p)).unwrap_or_default();
+                let commit_message = format!(
+                    "[cruise-control] {} iteration {}{}",
+                    llm, iteration, phase_str
+                );
+
+                // Commit changes
+                let commit_output = Command::new("git")
+                    .current_dir(sandbox_path)
+                    .args(["commit", "-m", &commit_message])
+                    .output()
+                    .ok()?;
+
+                if !commit_output.status.success() {
+                    tracing::warn!(
+                        error = %String::from_utf8_lossy(&commit_output.stderr),
+                        "failed to commit changes"
+                    );
+                }
+            }
+
+            // Get commit hash
+            let hash_output = Command::new("git")
+                .current_dir(sandbox_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()?;
+
+            String::from_utf8_lossy(&hash_output.stdout).trim().to_string()
+        } else {
+            tracing::debug!(iteration = iteration, "no uncommitted changes");
+
+            // Get current HEAD hash even if we didn't make a new commit
+            // (Claude might have committed directly)
+            let hash_output = Command::new("git")
+                .current_dir(sandbox_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()?;
+
+            String::from_utf8_lossy(&hash_output.stdout).trim().to_string()
+        };
+
+        // ALWAYS check if we need to push - Claude may have committed but not pushed
+        // Check for commits ahead of remote
+        let ahead_output = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["rev-list", "--count", &format!("origin/{}..HEAD", branch)])
+            .output();
+
+        let commits_ahead = ahead_output
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // Also check if the remote branch exists at all (for new branches)
+        let remote_exists = Command::new("git")
+            .current_dir(sandbox_path)
+            .args(["ls-remote", "--heads", "origin", &branch])
+            .output()
+            .ok()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+
+        let needs_push = commits_ahead > 0 || !remote_exists;
+
+        if !needs_push {
+            tracing::debug!(
+                iteration = iteration,
+                branch = %branch,
+                "branch is up to date with remote"
+            );
+            return Some(hash);
+        }
+
+        tracing::info!(
+            commits_ahead = commits_ahead,
+            remote_exists = remote_exists,
+            branch = %branch,
+            "pushing commits to remote"
+        );
 
         let push_output = Command::new("git")
             .current_dir(sandbox_path)
@@ -1140,10 +1192,17 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             }
         };
 
+        // Create commit message for observability record
+        let phase_str = phase.map(|p| format!(" - {}", p)).unwrap_or_default();
+        let record_message = format!(
+            "[cruise-control] {} iteration {}{}",
+            llm, iteration, phase_str
+        );
+
         // Record commit
         self.observability.commits.push(CommitRecord {
             hash: hash.clone(),
-            message: commit_message,
+            message: record_message,
             iteration,
             llm: llm.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -1225,40 +1284,60 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
     ///
     /// Returns true if there are commits that can be used to create a PR.
     /// This checks remote refs since the sandbox worktree may be cleaned up.
+    /// Includes retry logic to handle timing issues with remote refs.
     fn has_commits_on_branch(&self, repo_path: &Path) -> Result<bool> {
         // Get default branch name
         let default_branch = self.get_default_branch(repo_path)?;
 
-        // Fetch to ensure we have latest refs
-        let _ = Command::new("git")
-            .current_dir(repo_path)
-            .args(["fetch", "origin"])
-            .output();
+        // Retry up to 3 times with delays to handle timing issues
+        // Remote refs might not be immediately visible after push from worktree
+        let max_retries = 3;
+        let mut work_branch: Option<String> = None;
 
-        // List remote branches that aren't the default branch
-        let branch_output = Command::new("git")
-            .current_dir(repo_path)
-            .args(["branch", "-r", "--list", "origin/*"])
-            .output()
-            .map_err(|e| Error::Git(format!("failed to list remote branches: {}", e)))?;
+        for attempt in 1..=max_retries {
+            // Fetch to ensure we have latest refs
+            let _ = Command::new("git")
+                .current_dir(repo_path)
+                .args(["fetch", "origin"])
+                .output();
 
-        let branches_str = String::from_utf8_lossy(&branch_output.stdout);
+            // List remote branches that aren't the default branch
+            let branch_output = Command::new("git")
+                .current_dir(repo_path)
+                .args(["branch", "-r", "--list", "origin/*"])
+                .output()
+                .map_err(|e| Error::Git(format!("failed to list remote branches: {}", e)))?;
 
-        // Find work branches (feat/, feature/, plan/, etc.) - anything that's not the default branch
-        let work_branch = branches_str
-            .lines()
-            .map(|s| s.trim())
-            .find(|b| {
-                let stripped = b.trim_start_matches("origin/");
-                stripped.starts_with("feat") ||
-                stripped.starts_with("feature") ||
-                stripped.starts_with("plan") ||
-                stripped.starts_with("impl")
-            })
-            .map(|s| s.to_string());
+            let branches_str = String::from_utf8_lossy(&branch_output.stdout);
+
+            // Find work branches (feat/, feature/, plan/, etc.) - anything that's not the default branch
+            work_branch = branches_str
+                .lines()
+                .map(|s| s.trim())
+                .find(|b| {
+                    let stripped = b.trim_start_matches("origin/");
+                    stripped.starts_with("feat") ||
+                    stripped.starts_with("feature") ||
+                    stripped.starts_with("plan") ||
+                    stripped.starts_with("impl")
+                })
+                .map(|s| s.to_string());
+
+            if work_branch.is_some() {
+                break;
+            }
+
+            if attempt < max_retries {
+                tracing::debug!(
+                    attempt = attempt,
+                    "no work branch found, retrying after delay"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
 
         let Some(work_branch) = work_branch else {
-            tracing::warn!("no work branch found on remote");
+            tracing::warn!("no work branch found on remote after {} attempts", max_retries);
             return Ok(false);
         };
 

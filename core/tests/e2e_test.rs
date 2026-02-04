@@ -266,7 +266,8 @@ fn update_results_index() {
     md.push_str("| `smoke_hello` | Basic smoke test - create simple file |\n");
     md.push_str("| `code_generation` | Generate Rust code with tests |\n");
     md.push_str("| `full_web_app` | Full workflow with PingPong mode |\n");
-    md.push_str("| `full_web_app_github` | Full workflow with GitHub PR-based reviews |\n");
+    md.push_str("| `full_web_app_github` | Full workflow with GitHub PR-based reviews (complex) |\n");
+    md.push_str("| `simple_github` | GitHub PR-based reviews with simple task (fast) |\n");
     md.push_str("| `full_workflow_simple` | Full plan→approve→execute workflow |\n");
     md.push_str("| `smoke_hello_gemini` | Smoke test using Gemini instead of Claude |\n");
 
@@ -389,6 +390,34 @@ async fn full_web_app_github() {
         assert!(
             result.plan_pr_url.is_some(),
             "GitHub mode should create a plan PR"
+        );
+    }
+
+    assert!(result.passed, "E2E test failed: {:?}", result.error);
+}
+
+/// Test the GitHub PR-based coordination mode with a simple task.
+/// This is a faster alternative to full_web_app_github for testing the workflow.
+#[tokio::test]
+#[ignore]
+async fn simple_github() {
+    let harness = create_harness();
+    let fixture = Fixture::load(fixtures_dir().join("simple-github.yaml"))
+        .expect("failed to load fixture");
+
+    let result = harness.run_fixture(&fixture).await;
+    print_result(&result);
+    write_result_markdown(&result, "simple_github");
+
+    // For GitHub mode, we expect both plan PR and implementation PR
+    if result.passed {
+        assert!(
+            result.plan_pr_url.is_some(),
+            "GitHub mode should create a plan PR"
+        );
+        assert!(
+            result.pr_url.is_some(),
+            "GitHub mode should create an implementation PR"
         );
     }
 

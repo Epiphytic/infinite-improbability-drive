@@ -402,11 +402,12 @@ impl E2EHarness {
             .as_ref()
             .and_then(|p| p.pr_url.clone());
 
+        // Get implementation PR URL from observability (where it's stored by SpawnTeamOrchestrator)
         let pr_url = cruise_result
             .build_result
             .as_ref()
-            .and_then(|b| b.task_results.first())
-            .and_then(|t| t.pr_url.clone());
+            .and_then(|b| b.observability.as_ref())
+            .and_then(|o| o.pr_url.clone());
 
         let observability = Some(cruise_result.combined_observability());
 
