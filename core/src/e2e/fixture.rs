@@ -39,6 +39,23 @@ pub enum TeamMode {
     GitHub,
 }
 
+/// Which phase(s) of the workflow to execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    /// Run all phases (plan -> build -> validate).
+    #[default]
+    All,
+    /// Run only the planning phase.
+    PlanOnly,
+    /// Run only the build phase (requires existing plan PR).
+    BuildOnly,
+    /// Run only the validate phase (requires existing implementation).
+    ValidateOnly,
+    /// Run plan + build (skip validation).
+    PlanAndBuild,
+}
+
 /// Validation level for test results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +150,19 @@ pub struct Fixture {
     /// Team coordination mode (for spawn-team operations).
     #[serde(default)]
     pub team_mode: TeamMode,
+
+    /// Which phase(s) to execute.
+    #[serde(default)]
+    pub phase: ExecutionPhase,
+
+    /// Existing plan PR URL (for build_only or validate_only phases).
+    /// If not provided, a fresh plan will be generated.
+    #[serde(default)]
+    pub existing_plan_pr: Option<String>,
+
+    /// Existing implementation PR URL (for validate_only phase).
+    #[serde(default)]
+    pub existing_impl_pr: Option<String>,
 
     /// Environment variables to set when running LLMs.
     #[serde(default)]

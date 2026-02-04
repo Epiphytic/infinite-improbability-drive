@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::beads::{BeadsClient, CreateOptions, IssueStatus, IssueType, Priority, commit_issue_change};
+use crate::debug::{is_debug, is_fail_fast};
 use crate::error::{Error, Result};
 use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
@@ -257,16 +258,56 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
     ) -> Result<CruiseResult> {
         let start = Instant::now();
 
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] === Starting full workflow ===");
+            eprintln!("  prompt: {}...", &prompt[..prompt.len().min(100)]);
+            eprintln!("  runner_type: {:?}", runner_type);
+            eprintln!("  timeout: {:?}", timeout);
+            eprintln!("  repo_path: {}", repo_path.display());
+            eprintln!("  auto_approve: {}", self.auto_approve);
+            eprintln!("  use_spawn_team: {}", self.use_spawn_team);
+            eprintln!("  team_mode: {:?}", self.team_mode);
+            eprintln!("  fail_fast: {}", is_fail_fast());
+        }
+
         // Phase 0: Initialize beads
         self.init_beads(repo_path)?;
 
         // Phase 1: Planning
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] === Phase 1: PLANNING ===");
+        }
         let planning_prompt = self.create_planning_prompt(prompt);
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] Planning prompt created, length: {} chars", planning_prompt.len());
+        }
         let (plan_result, plan_issues) = self
             .run_planning_phase(&planning_prompt, runner_type, timeout, repo_path, prompt)
             .await?;
 
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] Planning phase result:");
+            eprintln!("  success: {}", plan_result.success);
+            eprintln!("  iterations: {}", plan_result.iterations);
+            eprintln!("  task_count: {}", plan_result.task_count);
+            eprintln!("  pr_url: {:?}", plan_result.pr_url);
+            eprintln!("  duration: {:?}", plan_result.duration);
+            if let Some(ref err) = plan_result.error {
+                eprintln!("  error: {}", err);
+            }
+        }
+
         if !plan_result.success {
+            let error_msg = format!(
+                "Planning phase failed: {}",
+                plan_result.error.as_deref().unwrap_or("unknown error")
+            );
+            if is_debug() {
+                eprintln!("[CRUISE_DEBUG] Planning phase FAILED: {}", error_msg);
+            }
+            if is_fail_fast() {
+                return Err(Error::Cruise(error_msg));
+            }
             return Ok(CruiseResult {
                 success: false,
                 prompt: prompt.to_string(),
@@ -343,9 +384,21 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
         }
 
         // Phase 3: Execution
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] === Phase 3: EXECUTION ===");
+            eprintln!("  plan_issues to implement: {}", plan_issues.len());
+        }
         let build_result = self
             .run_execution_phase(prompt, runner_type, timeout, repo_path, &plan_issues)
             .await?;
+
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] Execution phase result:");
+            eprintln!("  success: {}", build_result.success);
+            eprintln!("  completed_count: {}", build_result.completed_count);
+            eprintln!("  blocked_count: {}", build_result.blocked_count);
+            eprintln!("  duration: {:?}", build_result.duration);
+        }
 
         let success = build_result.success;
 
@@ -609,6 +662,15 @@ You must implement the following task. There is a detailed plan available in the
         // Generate a consistent branch name for the planning phase
         let branch_name = generate_branch_name(WorkflowPhase::Plan, original_prompt);
 
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] run_planning_phase_with_team starting");
+            eprintln!("  branch: {}", branch_name);
+            eprintln!("  team_mode: {:?}", self.team_mode);
+            eprintln!("  ping_pong_iterations: {}", self.config.planning.ping_pong_iterations);
+            eprintln!("  max_escalations: {}", self.max_escalations);
+            eprintln!("  timeout: {:?}", timeout);
+        }
+
         tracing::info!(
             branch = %branch_name,
             "starting planning phase"
@@ -623,6 +685,12 @@ You must implement the following task. There is a detailed plan available in the
             max_escalations: self.max_escalations,
         };
 
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] Team config:");
+            eprintln!("  primary_llm: {}", team_config.primary_llm);
+            eprintln!("  reviewer_llm: {}", team_config.reviewer_llm);
+        }
+
         let mut orchestrator = SpawnTeamOrchestrator::new(
             self.provider.clone(),
             self.logs_dir.join("planning-team"),
@@ -631,9 +699,26 @@ You must implement the following task. There is a detailed plan available in the
 
         // Run the orchestrator with the explicit branch name
         // All iterations use the same branch for consistency
+        if is_debug() {
+            eprintln!("[CRUISE_DEBUG] Calling orchestrator.run_with_branch...");
+        }
         let team_result = orchestrator
             .run_with_branch(planning_prompt, timeout, repo_path, Some(&branch_name))
-            .await?;
+            .await;
+
+        // Handle errors with fail-fast
+        let team_result = match team_result {
+            Ok(result) => result,
+            Err(e) => {
+                if is_debug() {
+                    eprintln!("[CRUISE_DEBUG] Orchestrator failed with error: {}", e);
+                }
+                if is_fail_fast() {
+                    return Err(e);
+                }
+                return Err(e);
+            }
+        };
 
         // Get observability data from orchestrator
         let observability = orchestrator.take_observability();

@@ -9,15 +9,43 @@ use improbability_drive::sandbox::WorktreeSandbox;
 use improbability_drive::spawn::Spawner;
 use improbability_drive::{SandboxManifest, SpawnConfig, SpawnStatus};
 
+/// Check if debug mode is enabled via environment variable.
+fn is_debug_mode() -> bool {
+    std::env::var("CRUISE_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Check if fail-fast mode is enabled via environment variable.
+fn is_fail_fast_mode() -> bool {
+    std::env::var("CRUISE_FAIL_FAST")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
+    let debug_mode = is_debug_mode();
+    let fail_fast = is_fail_fast_mode();
+
+    // Initialize tracing with debug level if CRUISE_DEBUG is set
+    let log_level = if debug_mode {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+                .add_directive(log_level.into()),
         )
         .init();
+
+    if debug_mode {
+        eprintln!("=== CRUISE DEBUG MODE ENABLED ===");
+        eprintln!("CRUISE_FAIL_FAST: {}", fail_fast);
+    }
 
     // Parse args (basic for now - will add clap in later phase)
     let args: Vec<String> = std::env::args().collect();

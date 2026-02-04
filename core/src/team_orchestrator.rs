@@ -722,12 +722,20 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
         self.observability.command_lines.push(CommandLineRecord {
             llm: self.config.primary_llm.clone(),
-            command,
+            command: command.clone(),
             work_dir: sandbox_path.to_path_buf(),
             iteration,
             role: "primary".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         });
+
+        crate::debug::debug_llm_invocation(
+            &self.config.primary_llm,
+            prompt,
+            sandbox_path,
+            iteration,
+            "primary",
+        );
 
         let spawner = Spawner::new(
             self.provider.clone(),
@@ -746,7 +754,28 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             "running primary LLM"
         );
 
-        let result = spawner.spawn_with_branch(config, manifest, Box::new(runner), branch_name).await?;
+        let result = spawner.spawn_with_branch(config, manifest, Box::new(runner), branch_name).await;
+
+        // Handle spawn result
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if crate::debug::is_debug() {
+                    eprintln!("[CRUISE_DEBUG] Primary LLM spawn FAILED: {}", e);
+                }
+                if crate::debug::is_fail_fast() {
+                    return Err(e);
+                }
+                return Err(e);
+            }
+        };
+
+        if crate::debug::is_debug() {
+            eprintln!("[CRUISE_DEBUG] Primary LLM spawn result:");
+            eprintln!("  status: {:?}", result.status);
+            eprintln!("  duration: {:?}", result.duration);
+            eprintln!("  sandbox_path: {:?}", result.sandbox_path);
+        }
 
         // Capture the actual sandbox path where work was done
         if let Some(ref sandbox) = result.sandbox_path {
@@ -907,14 +936,19 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Run Gemini directly (not through spawner - it's a reviewer, not making changes)
         // Use --yolo for auto-approval with --allowed-tools for Read access
+        let gemini_args = [
+            "--yolo",  // Auto-approve all actions
+            "--output-format", "stream-json",  // Structured output for debugging
+            "--allowed-tools", "Read,Glob,Grep",  // Read-only tools for review
+            "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
+        ];
+
+        crate::debug::debug_command("gemini", &gemini_args, sandbox_path);
+
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
-            .args([
-                "--yolo",  // Auto-approve all actions
-                "--allowed-tools", "Read,Glob,Grep",  // Read-only tools for review
-                "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
-            ])
+            .args(&gemini_args)
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
 
@@ -1548,29 +1582,54 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             "running GitHub reviewer"
         );
 
+        // Log review phase in debug mode
+        crate::debug::debug_review_phase(domain.as_str(), pr_number, diff.len());
+
         // Run Gemini with proper CLI arguments to execute the review
         // Using --yolo for auto-approval (--approval-mode plan requires experimental flag)
         // Include Bash in --allowed-tools for `gh pr comment` access
+        let gemini_args = [
+            "--yolo",  // Auto-approve all actions
+            "--output-format", "stream-json",  // Structured output for debugging
+            "--allowed-tools", "Read,Glob,Grep,Bash",  // Need Bash for gh pr comment
+            "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
+        ];
+
+        crate::debug::debug_command("gemini", &gemini_args, sandbox_path);
+
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
             .envs(&self.env_vars)
-            .args([
-                "--yolo",  // Auto-approve all actions
-                "--allowed-tools", "Read,Glob,Grep,Bash",  // Need Bash for gh pr comment
-                "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
-            ])
+            .args(&gemini_args)
             .output()
             .map_err(|e| Error::Cruise(format!("failed to run gemini: {}", e)))?;
 
         let raw_response = String::from_utf8_lossy(&output.stdout).to_string();
+        let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let gemini_success = output.status.success();
 
         tracing::debug!(
             domain = %domain.as_str(),
             exit_code = ?output.status.code(),
             stdout_len = raw_response.len(),
+            stderr_len = raw_stderr.len(),
             "gemini reviewer finished"
         );
+
+        // In debug mode, print stderr if there was any
+        if crate::debug::is_debug() && !raw_stderr.is_empty() {
+            eprintln!("[CRUISE_DEBUG] Gemini stderr:\n{}", raw_stderr);
+        }
+
+        // In fail-fast mode, abort if gemini failed
+        if !gemini_success && crate::debug::is_fail_fast() {
+            return Err(Error::Cruise(format!(
+                "Gemini reviewer failed in {} phase. Exit code: {:?}. Stderr: {}",
+                domain.as_str(),
+                output.status.code(),
+                raw_stderr
+            )));
+        }
 
         // Check if any review comments were created on the PR
         let reviews_created = self.check_for_new_reviews(pr_number, repo, sandbox_path)?;

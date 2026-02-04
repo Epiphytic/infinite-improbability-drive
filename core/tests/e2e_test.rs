@@ -423,3 +423,31 @@ async fn simple_github() {
 
     assert!(result.passed, "E2E test failed: {:?}", result.error);
 }
+
+/// Test only the planning phase (no build, no validation).
+/// This is useful for rapidly iterating on the planning workflow.
+///
+/// Run with debug logging:
+///   CRUISE_DEBUG=1 CRUISE_FAIL_FAST=1 E2E_KEEP_REPOS=1 cargo test --test e2e_test full_web_app_github_plan_only -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn full_web_app_github_plan_only() {
+    let harness = create_harness();
+    let fixture = Fixture::load(fixtures_dir().join("full-web-app-github-plan-only.yaml"))
+        .expect("failed to load fixture");
+
+    let result = harness.run_fixture(&fixture).await;
+    print_result(&result);
+    write_result_markdown(&result, "full_web_app_github_plan_only");
+
+    // For plan-only mode, we only expect a plan PR (no implementation PR)
+    if result.passed {
+        assert!(
+            result.plan_pr_url.is_some(),
+            "Plan-only mode should create a plan PR"
+        );
+        // No implementation PR expected
+    }
+
+    assert!(result.passed, "E2E test failed: {:?}", result.error);
+}
