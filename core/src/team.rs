@@ -241,6 +241,18 @@ impl ReviewDomain {
     }
 }
 
+/// Extracted metadata for PR creation.
+///
+/// This is extracted from the task description using an LLM before
+/// starting the workflow to ensure meaningful PR titles and branch names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMetadata {
+    /// Concise PR title (max 72 chars).
+    pub pr_title: String,
+    /// Branch name in kebab-case (max 50 chars).
+    pub branch_name: String,
+}
+
 /// Status of a spawn-team iteration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IterationStatus {
@@ -825,7 +837,9 @@ mod tests {
         assert!(prompt.contains("Line:** 42"));
         assert!(prompt.contains("456"));
         assert!(prompt.contains("Missing error handling"));
-        assert!(prompt.contains("gh pr comment 123"));
+        // Verify it instructs to use Read/Edit tools (commit handled automatically)
+        assert!(prompt.contains("Read tool"));
+        assert!(prompt.contains("Edit tool"));
     }
 
     #[test]
@@ -842,6 +856,18 @@ mod tests {
         let json = serde_json::to_string(&comment).unwrap();
         assert!(json.contains("\"id\":123"));
         assert!(json.contains("\"path\":\"src/main.rs\""));
+    }
+
+    #[test]
+    fn extracted_metadata_serializes() {
+        let metadata = ExtractedMetadata {
+            pr_title: "Add user authentication feature".to_string(),
+            branch_name: "feat/add-user-auth".to_string(),
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("Add user authentication feature"));
+        assert!(json.contains("feat/add-user-auth"));
     }
 
     #[test]

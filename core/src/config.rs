@@ -415,7 +415,9 @@ mod tests {
             mode: CoordinationMode::Sequential,
             max_iterations: 0,
             primary_llm: "claude-code".to_string(),
+            primary_model: None,
             reviewer_llm: "gemini-cli".to_string(),
+            reviewer_model: None,
             max_escalations: 5,
         };
         let result = config.validate();
@@ -429,7 +431,9 @@ mod tests {
             mode: CoordinationMode::PingPong,
             max_iterations: 20,
             primary_llm: "claude-code".to_string(),
+            primary_model: None,
             reviewer_llm: "gemini-cli".to_string(),
+            reviewer_model: None,
             max_escalations: 5,
         };
         let result = config.validate();
@@ -443,7 +447,9 @@ mod tests {
             mode: CoordinationMode::Sequential,
             max_iterations: 3,
             primary_llm: "unknown-llm".to_string(),
+            primary_model: None,
             reviewer_llm: "gemini-cli".to_string(),
+            reviewer_model: None,
             max_escalations: 5,
         };
         let result = config.validate();
@@ -457,7 +463,9 @@ mod tests {
             mode: CoordinationMode::Sequential,
             max_iterations: 3,
             primary_llm: "claude-code".to_string(),
+            primary_model: None,
             reviewer_llm: "gpt-4".to_string(),
+            reviewer_model: None,
             max_escalations: 5,
         };
         let result = config.validate();
@@ -471,7 +479,9 @@ mod tests {
             mode: CoordinationMode::Sequential,
             max_iterations: 3,
             primary_llm: "claude-code".to_string(),
+            primary_model: None,
             reviewer_llm: "claude-code".to_string(),
+            reviewer_model: None,
             max_escalations: 5,
         };
         let result = config.validate();
@@ -504,7 +514,9 @@ mod tests {
             mode: CoordinationMode::Sequential,
             max_iterations: 3,
             primary_llm: "claude-code".to_string(),
+            primary_model: None,
             reviewer_llm: "claude-code".to_string(), // Same - should warn
+            reviewer_model: None,
             max_escalations: 5,
         };
 

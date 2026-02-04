@@ -12,9 +12,9 @@ use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use crate::sandbox::{SandboxManifest, SandboxProvider};
 use crate::spawn::{SpawnConfig, SpawnResult, SpawnStatus, Spawner};
 use crate::team::{
-    parse_review_response, CoordinationMode, FixPromptBuilder, GitHubReview, GitHubReviewComment,
-    GitHubReviewPromptBuilder, ResolveCommentPromptBuilder, ReviewDomain, ReviewPromptBuilder,
-    ReviewResult, ReviewVerdict, SpawnTeamConfig, SpawnTeamResult,
+    parse_review_response, CoordinationMode, ExtractedMetadata, FixPromptBuilder, GitHubReview,
+    GitHubReviewComment, GitHubReviewPromptBuilder, ResolveCommentPromptBuilder, ReviewDomain,
+    ReviewPromptBuilder, ReviewResult, ReviewVerdict, SpawnTeamConfig, SpawnTeamResult,
 };
 
 /// Observability data captured during spawn-team execution.
@@ -178,6 +178,95 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         self.observability
     }
 
+    /// Extracts PR metadata (title and branch name) from the task description.
+    ///
+    /// Uses a lightweight LLM call to extract meaningful PR title and branch name
+    /// from the task description, avoiding ugly auto-generated names.
+    pub fn extract_metadata(&self, task: &str, work_dir: &Path) -> Result<ExtractedMetadata> {
+        let prompt = format!(
+            r#"Extract a concise PR title and branch name from this task description.
+
+Task: {}
+
+Requirements:
+- pr_title: A clear, concise title (max 72 chars) describing what the PR does
+- branch_name: A kebab-case branch name (max 50 chars) like "feat/add-user-auth" or "fix/login-bug"
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{"pr_title": "...", "branch_name": "..."}}"#,
+            task.chars().take(500).collect::<String>()
+        );
+
+        tracing::debug!("extracting PR metadata from task description");
+
+        // Use Claude for extraction (quick, lightweight call)
+        let output = Command::new("claude")
+            .current_dir(work_dir)
+            .args(["--print", "-p", &prompt])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to run claude for metadata extraction: {}", e)))?;
+
+        let response = String::from_utf8_lossy(&output.stdout).to_string();
+
+        // Parse JSON response
+        let json_start = response.find('{');
+        let json_end = response.rfind('}');
+
+        if let (Some(start), Some(end)) = (json_start, json_end) {
+            let json_str = &response[start..=end];
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let pr_title = parsed
+                    .get("pr_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Automated changes")
+                    .chars()
+                    .take(72)
+                    .collect::<String>();
+
+                let branch_name = parsed
+                    .get("branch_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("feat/automated-changes")
+                    .chars()
+                    .take(50)
+                    .collect::<String>()
+                    // Sanitize branch name
+                    .to_lowercase()
+                    .replace(' ', "-")
+                    .replace('_', "-");
+
+                tracing::info!(
+                    pr_title = %pr_title,
+                    branch_name = %branch_name,
+                    "extracted PR metadata"
+                );
+
+                return Ok(ExtractedMetadata {
+                    pr_title,
+                    branch_name,
+                });
+            }
+        }
+
+        // Fallback: generate from task
+        tracing::warn!("failed to extract PR metadata, using fallback");
+        let fallback_title: String = task.chars().take(70).collect();
+        let fallback_branch = format!(
+            "feat/{}",
+            task.chars()
+                .take(40)
+                .collect::<String>()
+                .to_lowercase()
+                .replace(' ', "-")
+                .replace(|c: char| !c.is_alphanumeric() && c != '-', "")
+        );
+
+        Ok(ExtractedMetadata {
+            pr_title: fallback_title,
+            branch_name: fallback_branch,
+        })
+    }
+
     /// Runs the spawn-team workflow.
     ///
     /// For Sequential mode: Primary -> Review -> Fix (once)
@@ -226,6 +315,25 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Determine if this is GitHub mode (affects how reviews are posted)
         let use_github_reviews = matches!(self.config.mode, CoordinationMode::GitHub);
 
+        // Extract PR metadata (title and branch name) before starting workflow
+        // This ensures meaningful PR titles and branch names
+        let extracted_metadata = if branch_name.is_none() {
+            match self.extract_metadata(prompt, sandbox_path) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to extract PR metadata, using fallback");
+                    None
+                }
+            }
+        } else {
+            None // Branch name provided explicitly, don't extract
+        };
+
+        // Use extracted branch name if available
+        let effective_branch_name = branch_name
+            .map(|s| s.to_string())
+            .or_else(|| extracted_metadata.as_ref().map(|m| m.branch_name.clone()));
+
         // Legacy sequential mode - kept for backwards compatibility
         if matches!(self.config.mode, CoordinationMode::Sequential) {
             return self
@@ -244,7 +352,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         );
 
         let primary_result = self
-            .run_primary(prompt, timeout, sandbox_path, 1, branch_name)
+            .run_primary(prompt, timeout, sandbox_path, 1, effective_branch_name.as_deref())
             .await?;
 
         if primary_result.status != SpawnStatus::Success {
@@ -288,7 +396,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         }
 
         tracing::info!("creating PR on first commit");
-        let created_pr_url = self.create_pr_on_first_commit(work_path, prompt, &repo)?;
+        let created_pr_url = self.create_pr_on_first_commit(work_path, prompt, &repo, extracted_metadata.as_ref())?;
         self.observability.pr_url = Some(created_pr_url.clone());
         pr_url = Some(created_pr_url.clone());
 
@@ -1419,6 +1527,7 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         repo_path: &Path,
         prompt: &str,
         repo: &str,
+        metadata: Option<&ExtractedMetadata>,
     ) -> Result<String> {
         // Get default branch
         let default_branch = self.get_default_branch(repo_path)?;
@@ -1459,12 +1568,16 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
             "creating PR from remote work branch"
         );
 
-        // Create PR title from prompt (truncate if needed)
-        let title: String = prompt.chars().take(70).collect();
-        let title = if prompt.len() > 70 {
-            format!("{}...", title)
+        // Create PR title - prefer extracted metadata, fallback to prompt
+        let title = if let Some(meta) = metadata {
+            meta.pr_title.clone()
         } else {
-            title
+            let title: String = prompt.chars().take(70).collect();
+            if prompt.len() > 70 {
+                format!("{}...", title)
+            } else {
+                title
+            }
         };
 
         // Create PR body with accordion for prompt
