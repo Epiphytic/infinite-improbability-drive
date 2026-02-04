@@ -191,6 +191,21 @@ impl<P: SandboxProvider> PhaseSandbox<P> {
         Ok(())
     }
 
+    /// Checks if any comment contains the [REVIEW COMPLETE] marker.
+    pub fn has_review_complete_marker(comments: &[CommentInfo]) -> bool {
+        comments
+            .iter()
+            .any(|c| c.body.contains("[REVIEW COMPLETE]"))
+    }
+
+    /// Filters comments to only those needing action (not [REVIEW COMPLETE]).
+    pub fn actionable_comments(comments: Vec<CommentInfo>) -> Vec<CommentInfo> {
+        comments
+            .into_iter()
+            .filter(|c| !c.body.contains("[REVIEW COMPLETE]"))
+            .collect()
+    }
+
     /// Loads a PhaseSandbox from saved state (for crash recovery).
     pub fn load_from_state(sandbox_path: &PathBuf, provider: P) -> Result<Self> {
         let state_file = PhaseState::state_file_path(sandbox_path);
@@ -336,5 +351,45 @@ mod tests {
 
         assert_eq!(loaded.pr_number(), Some(42));
         assert_eq!(loaded.branch_name(), "feat/state-test");
+    }
+
+    #[test]
+    fn phase_sandbox_detects_review_complete_marker() {
+        let comments = vec![
+            CommentInfo {
+                id: 1,
+                body: "Some feedback".to_string(),
+                path: None,
+                line: None,
+                author: "reviewer".to_string(),
+                created_at: "2026-02-04T10:00:00Z".to_string(),
+            },
+            CommentInfo {
+                id: 2,
+                body: "[REVIEW COMPLETE] All done".to_string(),
+                path: None,
+                line: None,
+                author: "reviewer".to_string(),
+                created_at: "2026-02-04T10:01:00Z".to_string(),
+            },
+        ];
+
+        assert!(PhaseSandbox::<WorktreeSandbox>::has_review_complete_marker(
+            &comments
+        ));
+    }
+
+    #[test]
+    fn phase_sandbox_no_marker_without_review_complete() {
+        let comments = vec![CommentInfo {
+            id: 1,
+            body: "Some feedback".to_string(),
+            path: None,
+            line: None,
+            author: "reviewer".to_string(),
+            created_at: "2026-02-04T10:00:00Z".to_string(),
+        }];
+
+        assert!(!PhaseSandbox::<WorktreeSandbox>::has_review_complete_marker(&comments));
     }
 }
