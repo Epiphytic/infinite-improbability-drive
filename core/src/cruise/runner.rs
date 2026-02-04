@@ -13,7 +13,7 @@ use crate::debug::{is_debug, is_fail_fast};
 use crate::error::{Error, Result};
 use crate::pr::{get_branch_commits, get_file_changes, PRManager};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
-use crate::sandbox::{SandboxManifest, SandboxProvider};
+use crate::sandbox::{PhaseSandbox, SandboxManifest, SandboxProvider};
 use crate::spawn::{SpawnConfig, SpawnResult, SpawnStatus, Spawner};
 use crate::team::{CoordinationMode, SpawnTeamConfig};
 use crate::team_orchestrator::{format_observability_markdown, SpawnTeamOrchestrator};
@@ -979,6 +979,34 @@ You must implement the following task. There is a detailed plan available in the
             .map(|pr| pr.url)
     }
 
+    /// Creates a persistent PhaseSandbox for the planning phase.
+    ///
+    /// The sandbox will persist until explicitly cleaned up, allowing multiple
+    /// LLM invocations (planner, reviewer, fixer) to share the same worktree.
+    ///
+    /// # Arguments
+    /// * `prompt` - The task prompt (used to generate branch name)
+    /// * `timeout` - Inactivity timeout for the sandbox (default: 24 hours)
+    ///
+    /// # Returns
+    /// A PhaseSandbox that must be explicitly cleaned up when done.
+    pub fn create_phase_sandbox_for_planning(
+        &self,
+        prompt: &str,
+        timeout: Option<Duration>,
+    ) -> Result<PhaseSandbox<P>> {
+        let branch_name = generate_branch_name(WorkflowPhase::Plan, prompt);
+        let timeout = timeout.unwrap_or(Duration::from_secs(86400)); // 24 hours default
+
+        tracing::info!(
+            branch = %branch_name,
+            timeout_secs = timeout.as_secs(),
+            "creating persistent phase sandbox for planning"
+        );
+
+        PhaseSandbox::new(self.provider.clone(), branch_name, timeout)
+    }
+
     /// Extracts plan from spawn output and creates beads issues.
     /// Returns both the created issues and the parsed plan.
     fn extract_and_create_beads_issues(
@@ -1809,5 +1837,57 @@ mod tests {
         };
         assert_eq!(issue.beads_id, "bd-1");
         assert_eq!(issue.plan_task_id, "CRUISE-001");
+    }
+
+    #[test]
+    fn cruise_runner_creates_phase_sandbox() {
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        // Create a test git repo
+        let temp = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        std::fs::write(temp.path().join("README.md"), "# Test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let provider = WorktreeSandbox::new(temp.path().to_path_buf(), None);
+        let runner = CruiseRunner::new(provider, PathBuf::from("/tmp/logs"));
+
+        // Create phase sandbox
+        let phase_sandbox = runner
+            .create_phase_sandbox_for_planning("test feature", None)
+            .unwrap();
+
+        // Verify sandbox was created
+        assert!(phase_sandbox.path().exists());
+        assert!(phase_sandbox.branch_name().starts_with("plan/"));
+
+        // Verify sandbox persists after PhaseSandbox is dropped
+        let path = phase_sandbox.path().clone();
+        drop(phase_sandbox);
+        assert!(path.exists(), "PhaseSandbox should persist after drop");
     }
 }
