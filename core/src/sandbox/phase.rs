@@ -392,4 +392,150 @@ mod tests {
 
         assert!(!PhaseSandbox::<WorktreeSandbox>::has_review_complete_marker(&comments));
     }
+
+    /// Integration test: Verifies sandbox persists across multiple operations
+    /// simulating the planner → reviewer → fixer workflow.
+    #[test]
+    fn phase_sandbox_persists_across_rounds() {
+        let repo = create_test_repo();
+        let provider = WorktreeSandbox::new(repo.path().to_path_buf(), None);
+
+        // Step 1: Create PhaseSandbox
+        let mut phase = PhaseSandbox::new(
+            provider.clone(),
+            "feat/persist-rounds".to_string(),
+            std::time::Duration::from_secs(86400),
+        )
+        .unwrap();
+
+        let sandbox_path = phase.path().clone();
+        assert!(sandbox_path.exists(), "Sandbox should be created");
+
+        // Step 2: Simulate planner - write a file
+        let plan_file = sandbox_path.join("plan.md");
+        std::fs::write(&plan_file, "# Plan\n\n- Task 1\n- Task 2").unwrap();
+        assert!(plan_file.exists(), "Planner should create plan file");
+
+        // Step 3: Commit the plan (simulating planner completion)
+        Command::new("git")
+            .args(["add", "plan.md"])
+            .current_dir(&sandbox_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add plan"])
+            .current_dir(&sandbox_path)
+            .output()
+            .unwrap();
+
+        // Verify sandbox still exists after "planner" work
+        assert!(
+            sandbox_path.exists(),
+            "Sandbox should persist after planner"
+        );
+        assert!(plan_file.exists(), "Plan file should persist");
+
+        // Step 4: Simulate reviewer - read files (no write)
+        let plan_content = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(plan_content.contains("Task 1"), "Reviewer should read plan");
+
+        // Verify sandbox still exists after "reviewer" read
+        assert!(
+            sandbox_path.exists(),
+            "Sandbox should persist after reviewer"
+        );
+
+        // Step 5: Add pending comments (simulating review feedback)
+        phase.add_pending_comment(CommentInfo {
+            id: 100,
+            body: "Please add Task 3".to_string(),
+            path: Some("plan.md".to_string()),
+            line: Some(4),
+            author: "reviewer".to_string(),
+            created_at: "2026-02-04T12:00:00Z".to_string(),
+        });
+        assert!(phase.has_pending_comments(), "Should have pending comment");
+
+        // Step 6: Simulate fixer - modify file based on comment
+        let comments = phase.take_pending_comments();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "Please add Task 3");
+
+        // Fixer updates the plan
+        std::fs::write(&plan_file, "# Plan\n\n- Task 1\n- Task 2\n- Task 3").unwrap();
+        Command::new("git")
+            .args(["add", "plan.md"])
+            .current_dir(&sandbox_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Address review: add Task 3"])
+            .current_dir(&sandbox_path)
+            .output()
+            .unwrap();
+
+        // Verify sandbox still exists after "fixer" work
+        assert!(sandbox_path.exists(), "Sandbox should persist after fixer");
+        let updated_content = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(
+            updated_content.contains("Task 3"),
+            "Fixer should update plan"
+        );
+
+        // Step 7: Save and restore state (simulating crash recovery)
+        phase.set_pr("https://github.com/test/repo/pull/99".to_string(), 99);
+        phase.save_state().unwrap();
+
+        // Simulate new instance loading from state
+        let loaded =
+            PhaseSandbox::<WorktreeSandbox>::load_from_state(&sandbox_path, provider).unwrap();
+        assert_eq!(loaded.pr_number(), Some(99));
+        assert_eq!(loaded.branch_name(), "feat/persist-rounds");
+        assert!(loaded.path().exists(), "Loaded sandbox should exist");
+
+        // Step 8: Explicit cleanup
+        let mut phase_for_cleanup = loaded;
+        phase_for_cleanup.cleanup().unwrap();
+
+        // Step 9: Verify sandbox is removed
+        assert!(
+            !sandbox_path.exists(),
+            "Sandbox should be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn phase_sandbox_actionable_comments_filters_review_complete() {
+        let comments = vec![
+            CommentInfo {
+                id: 1,
+                body: "Fix this bug".to_string(),
+                path: None,
+                line: None,
+                author: "reviewer".to_string(),
+                created_at: "2026-02-04T10:00:00Z".to_string(),
+            },
+            CommentInfo {
+                id: 2,
+                body: "[REVIEW COMPLETE]".to_string(),
+                path: None,
+                line: None,
+                author: "reviewer".to_string(),
+                created_at: "2026-02-04T10:01:00Z".to_string(),
+            },
+            CommentInfo {
+                id: 3,
+                body: "Also fix this".to_string(),
+                path: None,
+                line: None,
+                author: "reviewer".to_string(),
+                created_at: "2026-02-04T10:02:00Z".to_string(),
+            },
+        ];
+
+        let actionable = PhaseSandbox::<WorktreeSandbox>::actionable_comments(comments);
+        assert_eq!(actionable.len(), 2);
+        assert_eq!(actionable[0].id, 1);
+        assert_eq!(actionable[1].id, 3);
+    }
 }
