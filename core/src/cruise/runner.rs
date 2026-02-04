@@ -804,17 +804,28 @@ You must implement the following task. There is a detailed plan available in the
             }
         });
 
+        // For planning phase, success is determined by whether the plan was created
+        // and the PR was made, not by the review verdicts (which are informational feedback)
+        let plan_created = plan_issues.len() > 0 || pr_url.is_some();
+        let planning_success = plan_created && team_result.iterations > 0;
+
         let plan_result = PlanResult {
-            success: team_result.success,
+            success: planning_success,
             iterations: team_result.iterations,
             task_count,
             pr_url,
             duration: start.elapsed(),
             plan_file: None,
-            error: if team_result.success {
+            // Only set error if planning actually failed (no iterations or no plan created)
+            error: if planning_success {
                 None
             } else {
-                Some(team_result.summary)
+                Some(format!(
+                    "Planning failed: {} (iterations: {}, plan_created: {})",
+                    team_result.summary,
+                    team_result.iterations,
+                    plan_created
+                ))
             },
             observability: Some(observability),
         };
