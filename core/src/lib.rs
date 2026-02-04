@@ -3,6 +3,7 @@
 //! This library provides the core functionality for launching isolated LLM instances
 //! in git worktree sandboxes with intelligent resource provisioning and lifecycle management.
 
+pub mod backoff;
 pub mod beads;
 pub mod config;
 pub mod cruise;
