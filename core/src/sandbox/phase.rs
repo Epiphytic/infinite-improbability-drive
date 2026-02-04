@@ -190,6 +190,33 @@ impl<P: SandboxProvider> PhaseSandbox<P> {
 
         Ok(())
     }
+
+    /// Loads a PhaseSandbox from saved state (for crash recovery).
+    pub fn load_from_state(sandbox_path: &PathBuf, provider: P) -> Result<Self> {
+        let state_file = PhaseState::state_file_path(sandbox_path);
+        let json = std::fs::read_to_string(&state_file)
+            .map_err(|e| Error::Cruise(format!("failed to read state file: {}", e)))?;
+        let state: PhaseState = serde_json::from_str(&json)
+            .map_err(|e| Error::Cruise(format!("failed to parse state: {}", e)))?;
+
+        let backoff = ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300));
+
+        let repo_path = provider.repo_path().clone();
+
+        Ok(Self {
+            provider,
+            worktree_path: state.sandbox_path,
+            branch_name: state.branch_name,
+            repo_path,
+            pr_url: state.pr_url,
+            pr_number: state.pr_number,
+            last_activity: Instant::now(),
+            timeout: Duration::from_secs(86400),
+            backoff,
+            pending_comments: Vec::new(), // Comments reloaded from GitHub
+            cleaned_up: false,
+        })
+    }
 }
 
 // Note: No Drop implementation - cleanup is explicit only
@@ -283,5 +310,31 @@ mod tests {
         phase.cleanup().unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn phase_sandbox_saves_and_loads_state() {
+        let repo = create_test_repo();
+        let provider = WorktreeSandbox::new(repo.path().to_path_buf(), None);
+
+        let sandbox_path = {
+            let mut phase = PhaseSandbox::new(
+                provider.clone(),
+                "feat/state-test".to_string(),
+                std::time::Duration::from_secs(86400),
+            )
+            .unwrap();
+
+            phase.set_pr("https://github.com/test/repo/pull/42".to_string(), 42);
+            phase.save_state().unwrap();
+            phase.path().clone()
+        };
+
+        // Load from saved state
+        let loaded =
+            PhaseSandbox::<WorktreeSandbox>::load_from_state(&sandbox_path, provider).unwrap();
+
+        assert_eq!(loaded.pr_number(), Some(42));
+        assert_eq!(loaded.branch_name(), "feat/state-test");
     }
 }
