@@ -34,9 +34,15 @@ pub struct SpawnTeamConfig {
     /// Primary LLM identifier (e.g., "claude-code").
     #[serde(default = "default_primary_llm")]
     pub primary_llm: String,
+    /// Primary LLM model to use (e.g., "sonnet"). If None, use CLI default.
+    #[serde(default)]
+    pub primary_model: Option<String>,
     /// Reviewer LLM identifier (e.g., "gemini-cli").
     #[serde(default = "default_reviewer_llm")]
     pub reviewer_llm: String,
+    /// Reviewer LLM model to use (e.g., "gemini-3-flash-preview"). If None, use CLI default.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
     /// Maximum permission escalations allowed per spawn.
     #[serde(default = "default_max_escalations")]
     pub max_escalations: u32,
@@ -64,7 +70,9 @@ impl Default for SpawnTeamConfig {
             mode: CoordinationMode::default(),
             max_iterations: default_max_iterations(),
             primary_llm: default_primary_llm(),
+            primary_model: None, // Use CLI default
             reviewer_llm: default_reviewer_llm(),
+            reviewer_model: None, // Use CLI default
             max_escalations: default_max_escalations(),
         }
     }

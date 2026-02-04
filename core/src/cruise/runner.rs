@@ -131,6 +131,10 @@ pub struct CruiseRunner<P: SandboxProvider + Clone> {
     env_vars: std::collections::HashMap<String, String>,
     /// Maximum permission escalations allowed per spawn (default: 1)
     max_escalations: u32,
+    /// Model to use for primary LLM (e.g., "sonnet"). If None, use CLI default.
+    primary_model: Option<String>,
+    /// Model to use for reviewer LLM (e.g., "gemini-3-flash-preview"). If None, use CLI default.
+    reviewer_model: Option<String>,
 }
 
 impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
@@ -149,6 +153,8 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
             team_mode: crate::team::CoordinationMode::default(),
             env_vars,
             max_escalations: 5, // Allow 5 escalations for complex tasks
+            primary_model: None,
+            reviewer_model: None,
         }
     }
 
@@ -158,6 +164,24 @@ impl<P: SandboxProvider + Clone + 'static> CruiseRunner<P> {
     /// with auth, databases, and tests), increase this value.
     pub fn with_max_escalations(mut self, max: u32) -> Self {
         self.max_escalations = max;
+        self
+    }
+
+    /// Sets the model for the primary LLM (e.g., "sonnet" for Claude).
+    ///
+    /// For testing, use "sonnet" to ensure consistent behavior.
+    /// If not set, the CLI's default model is used.
+    pub fn with_primary_model(mut self, model: impl Into<String>) -> Self {
+        self.primary_model = Some(model.into());
+        self
+    }
+
+    /// Sets the model for the reviewer LLM (e.g., "gemini-3-flash-preview" for Gemini).
+    ///
+    /// For testing, use "gemini-3-flash-preview" to avoid quota issues.
+    /// If not set, the CLI's default model is used.
+    pub fn with_reviewer_model(mut self, model: impl Into<String>) -> Self {
+        self.reviewer_model = Some(model.into());
         self
     }
 
@@ -681,14 +705,18 @@ You must implement the following task. There is a detailed plan available in the
             mode: self.team_mode,
             max_iterations: self.config.planning.ping_pong_iterations,
             primary_llm: "claude-code".to_string(),
+            primary_model: self.primary_model.clone(),
             reviewer_llm: "gemini-cli".to_string(),
+            reviewer_model: self.reviewer_model.clone(),
             max_escalations: self.max_escalations,
         };
 
         if is_debug() {
             eprintln!("[CRUISE_DEBUG] Team config:");
             eprintln!("  primary_llm: {}", team_config.primary_llm);
+            eprintln!("  primary_model: {:?}", team_config.primary_model);
             eprintln!("  reviewer_llm: {}", team_config.reviewer_llm);
+            eprintln!("  reviewer_model: {:?}", team_config.reviewer_model);
         }
 
         let mut orchestrator = SpawnTeamOrchestrator::new(
@@ -1188,7 +1216,9 @@ You must implement the following task. There is a detailed plan available in the
             mode: self.team_mode,
             max_iterations: self.config.planning.ping_pong_iterations, // Reuse planning iterations
             primary_llm: "claude-code".to_string(),
+            primary_model: self.primary_model.clone(),
             reviewer_llm: "gemini-cli".to_string(),
+            reviewer_model: self.reviewer_model.clone(),
             max_escalations: self.max_escalations,
         };
 

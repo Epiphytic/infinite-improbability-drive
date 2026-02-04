@@ -380,7 +380,9 @@ impl E2EHarness {
         let runner = CruiseRunner::new(provider, logs_dir)
             .with_spawn_team(true)  // Enable spawn-team with Gemini reviews
             .with_team_mode(team_mode)  // Use the fixture's team mode
-            .with_auto_approve(true);  // Auto-approve plan PR
+            .with_auto_approve(true)  // Auto-approve plan PR
+            .with_primary_model("sonnet")  // Use sonnet for Claude in tests
+            .with_reviewer_model("gemini-3-flash-preview");  // Use flash model for Gemini in tests
 
         // Step 3: Run CruiseRunner.run_full() - this does ALL the work
         let cruise_result = match runner
@@ -583,7 +585,9 @@ impl E2EHarness {
         let runner = CruiseRunner::new(provider, logs_dir)
             .with_spawn_team(true)
             .with_team_mode(team_mode)
-            .with_auto_approve(false); // Don't auto-approve for plan-only
+            .with_auto_approve(false) // Don't auto-approve for plan-only
+            .with_primary_model("sonnet")  // Use sonnet for Claude in tests
+            .with_reviewer_model("gemini-3-flash-preview");  // Use flash model for Gemini in tests
 
         // Step 3: Run planning phase only
         // CruiseRunner.run_full() does planning, but we just want to run planning phase

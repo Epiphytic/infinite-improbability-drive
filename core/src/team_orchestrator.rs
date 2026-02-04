@@ -936,14 +936,23 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
 
         // Run Gemini directly (not through spawner - it's a reviewer, not making changes)
         // Use --yolo for auto-approval with --allowed-tools for Read access
-        let gemini_args = [
-            "--yolo",  // Auto-approve all actions
-            "--output-format", "stream-json",  // Structured output for debugging
-            "--allowed-tools", "Read,Glob,Grep",  // Read-only tools for review
-            "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
+        let mut gemini_args = vec![
+            "--yolo".to_string(),  // Auto-approve all actions
+            "--output-format".to_string(), "stream-json".to_string(),  // Structured output for debugging
+            "--allowed-tools".to_string(), "Read,Glob,Grep".to_string(),  // Read-only tools for review
         ];
 
-        crate::debug::debug_command("gemini", &gemini_args, sandbox_path);
+        // Add model if specified (for testing, use gemini-3-flash-preview)
+        if let Some(ref model) = self.config.reviewer_model {
+            gemini_args.push("--model".to_string());
+            gemini_args.push(model.clone());
+        }
+
+        gemini_args.push("-p".to_string());
+        gemini_args.push(review_prompt.clone());
+
+        let args_refs: Vec<&str> = gemini_args.iter().map(|s| s.as_str()).collect();
+        crate::debug::debug_command("gemini", &args_refs, sandbox_path);
 
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
@@ -1588,14 +1597,23 @@ impl<P: SandboxProvider + Clone + 'static> SpawnTeamOrchestrator<P> {
         // Run Gemini with proper CLI arguments to execute the review
         // Using --yolo for auto-approval (--approval-mode plan requires experimental flag)
         // Include Bash in --allowed-tools for `gh pr comment` access
-        let gemini_args = [
-            "--yolo",  // Auto-approve all actions
-            "--output-format", "stream-json",  // Structured output for debugging
-            "--allowed-tools", "Read,Glob,Grep,Bash",  // Need Bash for gh pr comment
-            "-p", &review_prompt,  // Use -p for prompt in non-interactive mode
+        let mut gemini_args = vec![
+            "--yolo".to_string(),  // Auto-approve all actions
+            "--output-format".to_string(), "stream-json".to_string(),  // Structured output for debugging
+            "--allowed-tools".to_string(), "Read,Glob,Grep,Bash".to_string(),  // Need Bash for gh pr comment
         ];
 
-        crate::debug::debug_command("gemini", &gemini_args, sandbox_path);
+        // Add model if specified (for testing, use gemini-3-flash-preview)
+        if let Some(ref model) = self.config.reviewer_model {
+            gemini_args.push("--model".to_string());
+            gemini_args.push(model.clone());
+        }
+
+        gemini_args.push("-p".to_string());
+        gemini_args.push(review_prompt.clone());
+
+        let args_refs: Vec<&str> = gemini_args.iter().map(|s| s.as_str()).collect();
+        crate::debug::debug_command("gemini", &args_refs, sandbox_path);
 
         let output = Command::new("gemini")
             .current_dir(sandbox_path)
