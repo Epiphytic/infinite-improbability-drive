@@ -214,7 +214,10 @@ impl ReviewDomain {
                  - Is the architecture sound and appropriate?\n\
                  - Are the right technologies/libraries being used?\n\
                  - Are there performance concerns or scalability issues?\n\
-                 - Is error handling appropriate?\n\n\
+                 - Is error handling appropriate?\n\
+                 - CRITICAL: For EVERY dependency/library version in the plan, use web search to verify \
+                   the latest stable version. Always request the latest stable release. Your cached \
+                   knowledge of version numbers is likely outdated — you MUST verify via web search.\n\n\
                  Create a GitHub review with 'request changes' if you find issues.\n\
                  Use line-specific comments for each concern."
             }
@@ -452,6 +455,9 @@ impl GitHubReviewPromptBuilder {
         prompt.push_str("\n```\n\n");
 
         prompt.push_str("### Instructions\n\n");
+        prompt.push_str("**IMPORTANT: Before requesting changes to any API usage, library version, or software configuration, \
+you MUST use web search to verify the latest documentation and stable versions. Your cached knowledge \
+is likely outdated. Search for the current docs/API before flagging something as incorrect.**\n\n");
         prompt.push_str("You MUST use the `gh` CLI to submit your feedback as PR comments.\n\n");
 
         prompt.push_str(
