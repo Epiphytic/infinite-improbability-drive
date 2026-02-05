@@ -2220,18 +2220,26 @@ Respond with ONLY a JSON object (no markdown, no explanation):
                     explanation: format!("Resolved in commit {}", commit_hash),
                 });
 
-            // Reply to the comment on GitHub
-            let reply_body = format!("Fixed in commit {}", commit_hash);
-            let _ = Command::new("gh")
-                .current_dir(sandbox_path)
-                .args([
-                    "pr",
-                    "comment",
-                    &pr_number.to_string(),
-                    "--body",
-                    &reply_body,
-                ])
-                .output();
+            // Reply as a thread child to the specific review comment
+            let reply_body = format!(
+                "Fixed in commit {}.\n\nChanges address the feedback in this comment.",
+                commit_hash
+            );
+            self.reply_to_review_comment(
+                repo,
+                pr_number,
+                comment_id,
+                &reply_body,
+                sandbox_path,
+            )?;
+
+            // Resolve the review thread
+            self.resolve_review_thread(
+                repo,
+                pr_number,
+                comment_id,
+                sandbox_path,
+            )?;
         }
 
         Ok(())
