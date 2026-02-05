@@ -1100,13 +1100,35 @@ You must implement the following task. There is a detailed plan available in the
             }
         }
 
-        // Commit the beads issue creation
+        // Commit and push the beads issue creation so they're visible on GitHub
         if !created_issues.is_empty() {
             let _ = commit_issue_change(
                 repo_path,
                 "plan",
                 &format!("Create {} beads issues from plan", created_issues.len()),
             );
+
+            // Push beads changes to remote for observability
+            let _ = Command::new("git")
+                .current_dir(repo_path)
+                .args(["push", "origin", "main"])
+                .output()
+                .map(|o| {
+                    if !o.status.success() {
+                        tracing::warn!(
+                            error = %String::from_utf8_lossy(&o.stderr),
+                            "failed to push beads issues to remote"
+                        );
+                    } else {
+                        tracing::info!("pushed beads issues to remote");
+                    }
+                });
+
+            // Also sync beads for bidirectional sync
+            let beads_sync = BeadsClient::new(repo_path);
+            if let Err(e) = beads_sync.sync() {
+                tracing::warn!(error = %e, "beads sync after issue creation failed");
+            }
         }
 
         Ok((created_issues, plan))
@@ -1558,6 +1580,20 @@ You must implement the following task. There is a detailed plan available in the
                 error,
             });
         }
+
+        // Push beads closures to remote for observability
+        let _ = Command::new("git")
+            .current_dir(repo_path)
+            .args(["push", "origin", "main"])
+            .output()
+            .map(|o| {
+                if !o.status.success() {
+                    tracing::warn!(
+                        error = %String::from_utf8_lossy(&o.stderr),
+                        "failed to push beads closures to remote"
+                    );
+                }
+            });
 
         // Sync beads at the end
         if let Err(e) = beads.sync() {
