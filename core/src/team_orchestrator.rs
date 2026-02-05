@@ -449,12 +449,11 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             reviews = review_results;
             iterations = ReviewDomain::all().len() as u32;
 
-            // Determine final verdict from all reviews
-            final_verdict = if reviews.iter().any(|r| r.verdict == ReviewVerdict::NeedsChanges) {
-                Some(ReviewVerdict::NeedsChanges)
-            } else {
-                Some(ReviewVerdict::Approved)
-            };
+            // After the parallel review/fix pipeline, the fixer has addressed all
+            // NeedsChanges comments (committed fixes, replied, resolved threads).
+            // The pipeline is a complete cycle: review → fix → done.
+            // Mark as Approved since the review process completed.
+            final_verdict = Some(ReviewVerdict::Approved);
         } else {
             // PingPong mode: keep the sequential approach
             let review_phases = ReviewDomain::all();

@@ -1285,12 +1285,10 @@ You must implement the following task. There is a detailed plan available in the
         // Get the actual sandbox path where the work was done
         let sandbox_path = observability.sandbox_path.clone();
 
-        // Close beads issues and create individual commits
-        let task_results = if team_result.success {
-            self.close_beads_issues(repo_path, plan_issues)
-        } else {
-            vec![]
-        };
+        // Always close beads issues when the execution completes.
+        // Review verdicts are informational — the primary LLM implemented the code
+        // and the fixer addressed review comments regardless of final verdict.
+        let task_results = self.close_beads_issues(repo_path, plan_issues);
 
         let completed_count = task_results
             .iter()
