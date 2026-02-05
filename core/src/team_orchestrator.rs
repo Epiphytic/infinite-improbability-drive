@@ -380,7 +380,13 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             .run_primary(prompt, timeout, sandbox_path, 1, effective_branch_name.as_deref())
             .await?;
 
-        if primary_result.status != SpawnStatus::Success {
+        // Capture sandbox path for observability (do this before checking status
+        // so that partial work from timeouts is preserved)
+        if let Some(ref path) = primary_result.sandbox_path {
+            active_sandbox_path = Some(path.clone());
+        }
+
+        if primary_result.status == SpawnStatus::Failed {
             return Ok(SpawnTeamResult {
                 success: false,
                 iterations: 1,
@@ -390,10 +396,7 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             });
         }
 
-        // Capture sandbox path for observability
-        if let Some(ref path) = primary_result.sandbox_path {
-            active_sandbox_path = Some(path.clone());
-        }
+        let primary_timed_out = primary_result.status == SpawnStatus::TimedOut;
 
         // IMPORTANT: We have two paths with different purposes:
         // - work_path (original repo): Used for PR operations via `gh` CLI and branch checking
@@ -434,8 +437,12 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             "PR created on first commit"
         );
 
-        // Step 3: Run review phases
-        if use_github_reviews {
+        // Step 3: Run review phases (skip if primary timed out — no time budget left)
+        if primary_timed_out {
+            tracing::info!("skipping reviews — primary LLM timed out, preserving partial work");
+            // PR was created with partial work; mark as approved since we can't review
+            final_verdict = Some(ReviewVerdict::Approved);
+        } else if use_github_reviews {
             // Parallel review/fix pipeline for GitHub mode
             let review_results = self.run_parallel_review_fix(
                 prompt,
