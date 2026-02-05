@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cleanup script for e2e test repositories
-# Usage: ./scripts/cleanup-e2e-repos.sh [--dry-run] [--all] [--older-than DAYS]
+# Usage: ./scripts/cleanup-e2e-repos.sh [--dry-run] [--all] [--older-than DURATION]
 
 set -euo pipefail
 
@@ -8,7 +8,7 @@ ORG="epiphytic"
 PREFIX="e2e-"
 DRY_RUN=false
 DELETE_ALL=false
-OLDER_THAN_DAYS=""
+OLDER_THAN=""
 
 usage() {
 	cat <<EOF
@@ -19,14 +19,17 @@ Delete e2e test repositories from the $ORG organization.
 Options:
     --dry-run           List repos that would be deleted without deleting them
     --all               Delete all e2e repos (default: interactive selection)
-    --older-than DAYS   Only delete repos older than DAYS days
-    -h, --help          Show this help message
+    --older-than DURATION  Only delete repos older than DURATION
+                            Supports: 2h (hours), 7d (days), or just 7 (days)
+    -h, --help             Show this help message
 
 Examples:
     $0                      # Interactive: select repos to delete
     $0 --dry-run            # List all e2e repos without deleting
     $0 --all                # Delete all e2e repos (with confirmation)
-    $0 --older-than 7       # Delete repos older than 7 days
+    $0 --older-than 2h      # Delete repos older than 2 hours
+    $0 --older-than 7d      # Delete repos older than 7 days
+    $0 --older-than 7       # Delete repos older than 7 days (default unit)
 EOF
 	exit 0
 }
@@ -43,7 +46,7 @@ while [[ $# -gt 0 ]]; do
 		shift
 		;;
 	--older-than)
-		OLDER_THAN_DAYS="$2"
+		OLDER_THAN="$2"
 		shift 2
 		;;
 	-h | --help)
@@ -79,8 +82,18 @@ if [[ -z "$REPOS_JSON" ]]; then
 fi
 
 # Filter by age if specified
-if [[ -n "$OLDER_THAN_DAYS" ]]; then
-	CUTOFF_DATE=$(date -v-${OLDER_THAN_DAYS}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -d "$OLDER_THAN_DAYS days ago" --iso-8601=seconds 2>/dev/null)
+if [[ -n "$OLDER_THAN" ]]; then
+	# Parse duration: 2h = 2 hours, 7d = 7 days, 7 = 7 days (default)
+	if [[ "$OLDER_THAN" =~ ^([0-9]+)h$ ]]; then
+		AMOUNT="${BASH_REMATCH[1]}"
+		CUTOFF_DATE=$(date -v-${AMOUNT}H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -d "$AMOUNT hours ago" --iso-8601=seconds 2>/dev/null)
+	elif [[ "$OLDER_THAN" =~ ^([0-9]+)d?$ ]]; then
+		AMOUNT="${BASH_REMATCH[1]}"
+		CUTOFF_DATE=$(date -v-${AMOUNT}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -d "$AMOUNT days ago" --iso-8601=seconds 2>/dev/null)
+	else
+		echo "Error: Invalid duration '$OLDER_THAN'. Use e.g. 2h (hours), 7d (days), or 7 (days)."
+		exit 1
+	fi
 	REPOS=$(echo "$REPOS_JSON" | jq -r "select(.createdAt < \"$CUTOFF_DATE\") | .name")
 else
 	REPOS=$(echo "$REPOS_JSON" | jq -r '.name')
