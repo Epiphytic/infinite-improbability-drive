@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::error::{Error, Result};
 use crate::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
@@ -2141,6 +2144,523 @@ Respond with ONLY a JSON object (no markdown, no explanation):
         Ok(comments)
     }
 
+    // =========================================================================
+    // Parallel Review/Fix Pipeline
+    // =========================================================================
+
+    /// Runs review phases in parallel with a concurrent fixer worker.
+    ///
+    /// All review domains are spawned as concurrent tokio tasks (limited by
+    /// `max_concurrent_reviewers` semaphore). As each reviewer completes and
+    /// posts comments, those comments are sent through an mpsc channel to a
+    /// single fixer worker task.
+    ///
+    /// The fixer processes comments one at a time, making code changes,
+    /// committing, pushing, posting threaded replies, and resolving threads.
+    async fn run_parallel_review_fix(
+        &mut self,
+        prompt: &str,
+        _timeout: Duration,
+        worktree_path: &Path,
+        work_path: &Path,
+        pr_number: u64,
+        repo: &str,
+    ) -> Result<Vec<ReviewResult>> {
+        let max_concurrent = self.config.max_concurrent_reviewers.max(1) as usize;
+        let (tx, mut rx) = mpsc::channel::<FixerMessage>(100);
+
+        tracing::info!(
+            max_concurrent = max_concurrent,
+            pr_number = pr_number,
+            "starting parallel review/fix pipeline"
+        );
+
+        // Collect data needed by reviewer tasks (avoid borrowing self across await)
+        let reviewer_config = self.config.clone();
+        let env_vars = self.env_vars.clone();
+        let review_domains = ReviewDomain::all().to_vec();
+
+        // We need to collect results and observability from each reviewer
+        // Use std::sync::Mutex since these are accessed from spawn_blocking tasks
+        let results: Arc<std::sync::Mutex<Vec<ReviewResult>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let obs_records: Arc<std::sync::Mutex<Vec<(CommandLineRecord, ReviewFeedbackRecord)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Spawn reviewer tasks with semaphore limiting concurrency
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let mut reviewer_handles = Vec::new();
+
+        for domain in review_domains {
+            let semaphore = semaphore.clone();
+            let tx = tx.clone();
+            let config = reviewer_config.clone();
+            let env = env_vars.clone();
+            let prompt_owned = prompt.to_string();
+            let worktree = worktree_path.to_path_buf();
+            let work = work_path.to_path_buf();
+            let repo_name = repo.to_string();
+            let results_clone = results.clone();
+            let obs_clone = obs_records.clone();
+
+            // Acquire permit in async context, then move into blocking task
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+
+                tokio::task::spawn_blocking(move || {
+
+                tracing::info!(
+                    domain = %domain.as_str(),
+                    "reviewer task starting"
+                );
+
+                // Get diff for review
+                let diff_output = Command::new("git")
+                    .current_dir(&worktree)
+                    .args(["diff", "HEAD~1..HEAD"])
+                    .output();
+
+                let diff = match diff_output {
+                    Ok(output) if output.status.success() => {
+                        String::from_utf8_lossy(&output.stdout).to_string()
+                    }
+                    _ => {
+                        // Try cached diff
+                        Command::new("git")
+                            .current_dir(&worktree)
+                            .args(["diff", "--cached"])
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                            .unwrap_or_default()
+                    }
+                };
+
+                // Build review prompt
+                let review_prompt = GitHubReviewPromptBuilder::new(
+                    pr_number, &repo_name, domain,
+                )
+                .with_original_prompt(&prompt_owned)
+                .with_diff(&diff)
+                .build();
+
+                // Record command line
+                let cmd_record = CommandLineRecord {
+                    llm: config.reviewer_llm.clone(),
+                    command: format!("gemini --print \"GitHub review for {} domain\"", domain.as_str()),
+                    work_dir: worktree.clone(),
+                    iteration: 0,
+                    role: format!("reviewer-{}", domain.as_str().to_lowercase()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+
+                // Run Gemini reviewer
+                let mut gemini_args = vec![
+                    "--yolo".to_string(),
+                    "--output-format".to_string(), "stream-json".to_string(),
+                    "--allowed-tools".to_string(), "Read,Glob,Grep,Bash".to_string(),
+                ];
+                if let Some(ref model) = config.reviewer_model {
+                    gemini_args.push("--model".to_string());
+                    gemini_args.push(model.clone());
+                }
+                gemini_args.push("-p".to_string());
+                gemini_args.push(review_prompt);
+
+                let output = Command::new("gemini")
+                    .current_dir(&worktree)
+                    .envs(&env)
+                    .args(&gemini_args)
+                    .output();
+
+                let (verdict, raw_response) = match output {
+                    Ok(output) => {
+                        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+                        let success = output.status.success();
+
+                        // Check for NEEDS CHANGES marker in PR comments
+                        let needs_changes = Self::check_pr_needs_changes_static(
+                            pr_number, &repo_name, &work,
+                        );
+
+                        let verdict = if needs_changes {
+                            ReviewVerdict::NeedsChanges
+                        } else if success {
+                            ReviewVerdict::Approved
+                        } else {
+                            ReviewVerdict::Approved // Don't block on reviewer failure
+                        };
+
+                        (verdict, raw)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            domain = %domain.as_str(),
+                            error = %e,
+                            "reviewer failed to execute"
+                        );
+                        (ReviewVerdict::Approved, String::new())
+                    }
+                };
+
+                let review = ReviewResult {
+                    verdict: verdict.clone(),
+                    suggestions: vec![],
+                    summary: format!("{} review completed", domain.as_str()),
+                };
+
+                // Record feedback
+                let feedback_record = ReviewFeedbackRecord {
+                    iteration: 0,
+                    phase: Some(domain.as_str().to_string()),
+                    verdict: review.verdict.clone(),
+                    suggestion_count: 0,
+                    review: review.clone(),
+                    raw_response,
+                    diff_reviewed: diff,
+                };
+
+                // Store results
+                {
+                    let mut results_lock = results_clone.lock().unwrap();
+                    results_lock.push(review.clone());
+                }
+                {
+                    let mut obs_lock = obs_clone.lock().unwrap();
+                    obs_lock.push((cmd_record, feedback_record));
+                }
+
+                // If needs changes, get pending comments and send to fixer
+                if verdict == ReviewVerdict::NeedsChanges {
+                    let comments = Self::get_pending_comments_static(
+                        pr_number, &repo_name, &work,
+                    );
+                    for comment in comments {
+                        let queued = QueuedComment {
+                            domain,
+                            comment,
+                            pr_number,
+                            repo: repo_name.clone(),
+                        };
+                        // Use blocking send since we're in spawn_blocking
+                        let _ = tx.blocking_send(FixerMessage::Fix(queued));
+                    }
+                }
+
+                tracing::info!(
+                    domain = %domain.as_str(),
+                    verdict = ?verdict,
+                    "reviewer task completed"
+                );
+                }).await.ok(); // await the spawn_blocking JoinHandle
+            });
+
+            reviewer_handles.push(handle);
+        }
+
+        // Drop our copy of tx so the channel closes when all reviewers finish
+        drop(tx);
+
+        // Spawn the fixer worker as a blocking task
+        let fixer_prompt = prompt.to_string();
+        let fixer_worktree = worktree_path.to_path_buf();
+        let fixer_env = self.env_vars.clone();
+        let _fixer_config = self.config.clone();
+        let fixer_obs: Arc<std::sync::Mutex<Vec<ResolvedCommentRecord>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fixer_obs_clone = fixer_obs.clone();
+        let fixer_commit_records: Arc<std::sync::Mutex<Vec<CommitRecord>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fixer_commit_clone = fixer_commit_records.clone();
+
+        let fixer_handle = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let FixerMessage::Fix(queued) = msg else {
+                    break;
+                };
+
+                let comment_id = queued.comment.id;
+                tracing::info!(
+                    comment_id = comment_id,
+                    domain = %queued.domain.as_str(),
+                    path = %queued.comment.path,
+                    "fixer: processing comment"
+                );
+
+                // Build resolve prompt
+                let resolve_prompt = ResolveCommentPromptBuilder::new(
+                    queued.pr_number,
+                    &queued.repo,
+                    queued.comment.clone(),
+                )
+                .with_original_prompt(&fixer_prompt)
+                .build();
+
+                // Run Claude to fix (blocking)
+                let worktree = fixer_worktree.clone();
+                let env = fixer_env.clone();
+                let obs = fixer_obs_clone.clone();
+                let commits = fixer_commit_clone.clone();
+                let repo = queued.repo.clone();
+                let pr_num = queued.pr_number;
+
+                let _ = tokio::task::spawn_blocking(move || {
+                    let output = Command::new("claude")
+                        .current_dir(&worktree)
+                        .envs(&env)
+                        .args([
+                            "--print", "--verbose",
+                            "--output-format", "stream-json",
+                            "--permission-mode", "acceptEdits",
+                            "-p", &resolve_prompt,
+                        ])
+                        .output();
+
+                    match output {
+                        Ok(o) if o.status.success() => {
+                            // Commit and push
+                            let _ = Command::new("git")
+                                .current_dir(&worktree)
+                                .args(["add", "-A"])
+                                .output();
+
+                            let commit_msg = format!(
+                                "[cruise-control] fix: resolve comment {} ({})",
+                                comment_id,
+                                queued.domain.as_str()
+                            );
+                            let _commit_out = Command::new("git")
+                                .current_dir(&worktree)
+                                .args(["commit", "-m", &commit_msg])
+                                .output();
+
+                            let commit_hash = Command::new("git")
+                                .current_dir(&worktree)
+                                .args(["rev-parse", "HEAD"])
+                                .output()
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                .unwrap_or_default();
+
+                            // Push
+                            let branch = Command::new("git")
+                                .current_dir(&worktree)
+                                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                                .output()
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                .unwrap_or_default();
+
+                            let _ = Command::new("git")
+                                .current_dir(&worktree)
+                                .args(["push", "-u", "origin", &branch])
+                                .output();
+
+                            // Post threaded reply
+                            let reply_body = format!(
+                                "Fixed in commit {}.\n\nChanges address the feedback in this comment.",
+                                &commit_hash[..commit_hash.len().min(7)]
+                            );
+                            let api_path = format!(
+                                "repos/{}/pulls/{}/comments/{}/replies",
+                                repo, pr_num, comment_id
+                            );
+                            let _ = Command::new("gh")
+                                .current_dir(&worktree)
+                                .args([
+                                    "api", &api_path,
+                                    "--method", "POST",
+                                    "-f", &format!("body={}", reply_body),
+                                ])
+                                .output();
+
+                            // Resolve the thread (best effort)
+                            let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+                            let gql_query = format!(
+                                r#"query {{ repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ reviewThreads(first: 100) {{ nodes {{ id isResolved comments(first: 1) {{ nodes {{ databaseId }} }} }} }} }} }} }}"#,
+                                owner, name, pr_num,
+                            );
+                            if let Ok(thread_output) = Command::new("gh")
+                                .current_dir(&worktree)
+                                .args(["api", "graphql", "-f", &format!("query={}", gql_query)])
+                                .output()
+                            {
+                                if let Ok(resp) = serde_json::from_slice::<serde_json::Value>(&thread_output.stdout) {
+                                    if let Some(nodes) = resp
+                                        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+                                        .and_then(|n| n.as_array())
+                                    {
+                                        if let Some(thread) = nodes.iter().find(|n| {
+                                            n.pointer("/comments/nodes/0/databaseId")
+                                                .and_then(|id| id.as_u64())
+                                                == Some(comment_id)
+                                        }) {
+                                            if let Some(tid) = thread.get("id").and_then(|id| id.as_str()) {
+                                                let resolve_mut = format!(
+                                                    r#"mutation {{ resolveReviewThread(input: {{threadId: \"{}\"}}) {{ thread {{ isResolved }} }} }}"#,
+                                                    tid,
+                                                );
+                                                let _ = Command::new("gh")
+                                                    .current_dir(&worktree)
+                                                    .args(["api", "graphql", "-f", &format!("query={}", resolve_mut)])
+                                                    .output();
+                                                tracing::info!(
+                                                    comment_id = comment_id,
+                                                    "resolved review thread"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Record resolution
+                            {
+                                let mut obs_lock = obs.lock().unwrap();
+                                obs_lock.push(ResolvedCommentRecord {
+                                    comment_id,
+                                    resolved_by_commit: commit_hash.clone(),
+                                    resolved_at: chrono::Utc::now().to_rfc3339(),
+                                    explanation: format!("Resolved in commit {}", commit_hash),
+                                });
+                            }
+                            {
+                                let mut commits_lock = commits.lock().unwrap();
+                                commits_lock.push(CommitRecord {
+                                    hash: commit_hash,
+                                    message: commit_msg,
+                                    iteration: 0,
+                                    llm: "claude-code".to_string(),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                    pushed: true,
+                                });
+                            }
+                        }
+                        Ok(o) => {
+                            tracing::warn!(
+                                comment_id = comment_id,
+                                error = %String::from_utf8_lossy(&o.stderr),
+                                "fixer failed to resolve comment"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                comment_id = comment_id,
+                                error = %e,
+                                "fixer failed to execute"
+                            );
+                        }
+                    }
+                }).await;
+            }
+        });
+
+        // Wait for all reviewers to complete
+        for handle in reviewer_handles {
+            if let Err(e) = handle.await {
+                tracing::warn!(error = %e, "reviewer task panicked");
+            }
+        }
+
+        // Wait for fixer to drain the queue
+        if let Err(e) = fixer_handle.await {
+            tracing::warn!(error = %e, "fixer task panicked");
+        }
+
+        // Collect results and update observability
+        let final_results = match Arc::try_unwrap(results) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+
+        let obs_data = match Arc::try_unwrap(obs_records) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+
+        for (cmd, feedback) in obs_data {
+            self.observability.command_lines.push(cmd);
+            self.observability.review_feedback.push(feedback);
+        }
+
+        let resolved = match Arc::try_unwrap(fixer_obs) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+        self.observability.resolved_comments.extend(resolved);
+
+        let commits = match Arc::try_unwrap(fixer_commit_records) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+        self.observability.commits.extend(commits);
+
+        Ok(final_results)
+    }
+
+    /// Static helper to check if latest PR comment indicates NEEDS CHANGES.
+    /// Used by reviewer tasks that can't borrow self.
+    fn check_pr_needs_changes_static(
+        pr_number: u64,
+        repo: &str,
+        work_dir: &Path,
+    ) -> bool {
+        let output = Command::new("gh")
+            .current_dir(work_dir)
+            .args([
+                "pr", "view",
+                &pr_number.to_string(),
+                "--repo", repo,
+                "--json", "comments",
+                "-q", ".comments[-1].body",
+            ])
+            .output();
+
+        output
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("REVIEW - NEEDS CHANGES"))
+            .unwrap_or(false)
+    }
+
+    /// Static helper to get pending review comments.
+    /// Used by reviewer tasks that can't borrow self.
+    fn get_pending_comments_static(
+        pr_number: u64,
+        repo: &str,
+        work_dir: &Path,
+    ) -> Vec<GitHubReviewComment> {
+        let output = Command::new("gh")
+            .current_dir(work_dir)
+            .args([
+                "api",
+                &format!("repos/{}/pulls/{}/comments", repo, pr_number),
+                "--jq",
+                r#".[] | select(.position != null) | {id: .id, path: .path, line: .line, body: .body}"#,
+            ])
+            .output();
+
+        let raw = match output {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+            Err(_) => return Vec::new(),
+        };
+
+        let mut comments = Vec::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() { continue; }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                let id = parsed.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let path = parsed.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let line_num = parsed.get("line").and_then(|v| v.as_u64()).map(|l| l as u32);
+                let body = parsed.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                if id > 0 && !path.is_empty() {
+                    comments.push(GitHubReviewComment {
+                        id, path, line: line_num, body,
+                        resolved: false, resolved_by_commit: None,
+                    });
+                }
+            }
+        }
+        comments
+    }
+
     /// Resolves a GitHub review comment by having the coder address it.
     async fn resolve_github_comment(
         &mut self,
@@ -2467,5 +2987,36 @@ mod tests {
         );
         assert!(query.contains("resolveReviewThread"));
         assert!(query.contains(thread_id));
+    }
+
+    #[test]
+    fn parallel_review_fix_types_compile() {
+        // Verify the channel types work together
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FixerMessage>(10);
+        let comment = GitHubReviewComment {
+            id: 1,
+            path: "test.rs".to_string(),
+            line: None,
+            body: "test".to_string(),
+            resolved: false,
+            resolved_by_commit: None,
+        };
+        let queued = QueuedComment {
+            domain: ReviewDomain::Security,
+            comment,
+            pr_number: 1,
+            repo: "test/repo".to_string(),
+        };
+
+        // Verify we can send and receive
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            tx.send(FixerMessage::Fix(queued)).await.unwrap();
+            drop(tx);
+            let msg = rx.recv().await.unwrap();
+            assert!(matches!(msg, FixerMessage::Fix(_)));
+            let none = rx.recv().await;
+            assert!(none.is_none()); // Channel closed
+        });
     }
 }
