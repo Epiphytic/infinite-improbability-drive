@@ -53,6 +53,75 @@ pub struct SandboxManifest {
     pub complexity: TaskComplexity,
 }
 
+impl SandboxManifest {
+    /// Creates a manifest with sensible defaults for most development tasks.
+    ///
+    /// Includes:
+    /// - Common Claude Code tools (Read, Write, Edit, Glob, Grep, Bash)
+    /// - Common CLI commands (git, gh, curl, jq, grep, etc.)
+    /// - Full read/write access to the worktree
+    ///
+    /// This avoids constant escalation for standard development work.
+    pub fn with_sensible_defaults() -> Self {
+        Self {
+            readable_paths: vec![
+                "**/*".to_string(), // Read anything in worktree
+            ],
+            writable_paths: vec![
+                "**/*".to_string(), // Write anything in worktree
+            ],
+            allowed_tools: vec![
+                // Core Claude Code tools
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string(),
+                "Bash".to_string(),
+                "LS".to_string(),
+                // Web tools
+                "WebFetch".to_string(),
+                "WebSearch".to_string(),
+            ],
+            allowed_commands: vec![
+                // Version control
+                "git *".to_string(),
+                "gh *".to_string(),
+                // Build tools
+                "cargo *".to_string(),
+                "npm *".to_string(),
+                "npx *".to_string(),
+                "yarn *".to_string(),
+                "pnpm *".to_string(),
+                "make *".to_string(),
+                // Common utilities
+                "curl *".to_string(),
+                "jq *".to_string(),
+                "grep *".to_string(),
+                "find *".to_string(),
+                "ls *".to_string(),
+                "cat *".to_string(),
+                "head *".to_string(),
+                "tail *".to_string(),
+                "wc *".to_string(),
+                "sort *".to_string(),
+                "uniq *".to_string(),
+                // Crypto/security tools
+                "openssl *".to_string(),
+                "jwt *".to_string(),
+                "ssh-keygen *".to_string(),
+                // Test runners
+                "pytest *".to_string(),
+                "jest *".to_string(),
+                "playwright *".to_string(),
+            ],
+            environment: HashMap::new(),
+            secrets: vec![],
+            complexity: TaskComplexity::Medium,
+        }
+    }
+}
+
 /// Represents an active sandbox environment.
 pub trait Sandbox: Send + Sync {
     /// Returns the working directory path of the sandbox.
@@ -71,7 +140,22 @@ pub trait SandboxProvider: Send + Sync {
     type Sandbox: Sandbox;
 
     /// Creates a new sandbox with the given manifest.
+    /// Uses auto-generated branch name.
     fn create(&self, manifest: SandboxManifest) -> Result<Self::Sandbox>;
+
+    /// Creates a new sandbox with an explicit branch name.
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    fn create_with_branch(
+        &self,
+        manifest: SandboxManifest,
+        branch_name: &str,
+    ) -> Result<Self::Sandbox>;
+
+    /// Returns the path to the repository root.
+    ///
+    /// This is used for checking repo state before launching LLMs
+    /// (e.g., checking for .gitignore).
+    fn repo_path(&self) -> &PathBuf;
 }
 
 #[cfg(test)]

@@ -51,6 +51,9 @@ pub struct PlanningConfig {
     /// Reviewer LLM identifier.
     #[serde(default = "default_reviewer_llm")]
     pub reviewer_llm: String,
+    /// Maximum number of concurrent reviewer LLMs in GitHub mode.
+    #[serde(default = "default_max_concurrent_reviewers")]
+    pub max_concurrent_reviewers: u32,
 }
 
 fn default_ping_pong_iterations() -> u32 {
@@ -61,11 +64,16 @@ fn default_reviewer_llm() -> String {
     "gemini-cli".to_string()
 }
 
+fn default_max_concurrent_reviewers() -> u32 {
+    3
+}
+
 impl Default for PlanningConfig {
     fn default() -> Self {
         Self {
             ping_pong_iterations: default_ping_pong_iterations(),
             reviewer_llm: default_reviewer_llm(),
+            max_concurrent_reviewers: default_max_concurrent_reviewers(),
         }
     }
 }
@@ -169,6 +177,62 @@ pub struct TestConfig {
     pub repo_lifecycle: RepoLifecycle,
 }
 
+/// Configuration for LLM timeouts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutsConfig {
+    /// Idle timeout in seconds (no activity before termination).
+    /// Default: 300s (5 minutes) - allows thinking time for complex tasks.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    /// Total timeout in seconds (wall-clock time limit).
+    /// Default: 3600s (1 hour) for full workflow tasks.
+    #[serde(default = "default_total_timeout")]
+    pub total_timeout_secs: u64,
+    /// Planning-specific idle timeout (planning often requires more thinking).
+    /// Default: 600s (10 minutes).
+    #[serde(default = "default_planning_idle_timeout")]
+    pub planning_idle_timeout_secs: u64,
+}
+
+fn default_idle_timeout() -> u64 {
+    300 // 5 minutes - allows thinking time
+}
+
+fn default_total_timeout() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_planning_idle_timeout() -> u64 {
+    600 // 10 minutes - planning requires more thinking
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_idle_timeout(),
+            total_timeout_secs: default_total_timeout(),
+            planning_idle_timeout_secs: default_planning_idle_timeout(),
+        }
+    }
+}
+
+impl TimeoutsConfig {
+    /// Returns the idle timeout as a Duration.
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs)
+    }
+
+    /// Returns the total timeout as a Duration.
+    pub fn total_timeout(&self) -> Duration {
+        Duration::from_secs(self.total_timeout_secs)
+    }
+
+    /// Returns the planning idle timeout as a Duration.
+    pub fn planning_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.planning_idle_timeout_secs)
+    }
+}
+
 fn default_org() -> String {
     "epiphytic".to_string()
 }
@@ -200,6 +264,9 @@ pub struct CruiseConfig {
     /// E2E test configuration.
     #[serde(default)]
     pub test: TestConfig,
+    /// LLM timeout configuration.
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
 }
 
 #[cfg(test)]
@@ -212,11 +279,16 @@ mod tests {
 
         assert_eq!(config.planning.ping_pong_iterations, 5);
         assert_eq!(config.planning.reviewer_llm, "gemini-cli");
+        assert_eq!(config.planning.max_concurrent_reviewers, 3);
         assert_eq!(config.building.max_parallel, 3);
         assert_eq!(config.building.pr_strategy, PrStrategy::PerTask);
         assert_eq!(config.validation.test_level, TestLevel::Functional);
         assert_eq!(config.approval.poll_initial, Duration::from_secs(60));
         assert_eq!(config.test.default_org, "epiphytic");
+        // Timeout defaults - generous for LLM planning
+        assert_eq!(config.timeouts.idle_timeout_secs, 300);
+        assert_eq!(config.timeouts.total_timeout_secs, 3600);
+        assert_eq!(config.timeouts.planning_idle_timeout_secs, 600);
     }
 
     #[test]
