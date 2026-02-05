@@ -767,18 +767,18 @@ You must implement the following task. There is a detailed plan available in the
         let mut task_count = 0;
         let mut parsed_plan: Option<CruisePlan> = None;
 
-        // Create beads issues from plan if successful
-        if team_result.success {
-            if let Some(ref sandbox) = sandbox_path {
-                match self.extract_and_create_beads_issues(sandbox, repo_path) {
-                    Ok((issues, plan)) => {
-                        task_count = issues.len();
-                        plan_issues = issues;
-                        parsed_plan = Some(plan);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to create beads issues from plan");
-                    }
+        // Always try to extract beads issues from the plan if the sandbox exists.
+        // Review verdicts are informational for planning — the plan file was created
+        // by the primary LLM regardless of whether reviewers requested changes.
+        if let Some(ref sandbox) = sandbox_path {
+            match self.extract_and_create_beads_issues(sandbox, repo_path) {
+                Ok((issues, plan)) => {
+                    task_count = issues.len();
+                    plan_issues = issues;
+                    parsed_plan = Some(plan);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create beads issues from plan");
                 }
             }
         }
@@ -786,20 +786,16 @@ You must implement the following task. There is a detailed plan available in the
         // Get PR URL from observability (created on first commit by SpawnTeamOrchestrator)
         // If not present (e.g., in Sequential mode), create one now
         let pr_url = observability.pr_url.clone().or_else(|| {
-            if team_result.success {
-                if let Some(ref sandbox) = sandbox_path {
-                    // Include observability in the PR body
-                    self.create_plan_pr_with_observability(
-                        sandbox,
-                        repo_path,
-                        original_prompt,
-                        parsed_plan.as_ref(),
-                        &observability,
-                        team_result.iterations,
-                    )
-                } else {
-                    None
-                }
+            if let Some(ref sandbox) = sandbox_path {
+                // Include observability in the PR body
+                self.create_plan_pr_with_observability(
+                    sandbox,
+                    repo_path,
+                    original_prompt,
+                    parsed_plan.as_ref(),
+                    &observability,
+                    team_result.iterations,
+                )
             } else {
                 None
             }
