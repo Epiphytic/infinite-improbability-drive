@@ -419,6 +419,7 @@ mod tests {
             reviewer_llm: "gemini-cli".to_string(),
             reviewer_model: None,
             max_escalations: 5,
+            max_concurrent_reviewers: 3,
         };
         let result = config.validate();
         assert!(!result.is_valid());
@@ -435,6 +436,7 @@ mod tests {
             reviewer_llm: "gemini-cli".to_string(),
             reviewer_model: None,
             max_escalations: 5,
+            max_concurrent_reviewers: 3,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -451,6 +453,7 @@ mod tests {
             reviewer_llm: "gemini-cli".to_string(),
             reviewer_model: None,
             max_escalations: 5,
+            max_concurrent_reviewers: 3,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -467,6 +470,7 @@ mod tests {
             reviewer_llm: "gpt-4".to_string(),
             reviewer_model: None,
             max_escalations: 5,
+            max_concurrent_reviewers: 3,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -483,6 +487,7 @@ mod tests {
             reviewer_llm: "claude-code".to_string(),
             reviewer_model: None,
             max_escalations: 5,
+            max_concurrent_reviewers: 3,
         };
         let result = config.validate();
         assert!(result.is_valid());
@@ -518,6 +523,7 @@ mod tests {
             reviewer_llm: "claude-code".to_string(), // Same - should warn
             reviewer_model: None,
             max_escalations: 5,
+            max_concurrent_reviewers: 3,
         };
 
         let result = validate_spawn_team_operation(&config, &manifest, &team_config);

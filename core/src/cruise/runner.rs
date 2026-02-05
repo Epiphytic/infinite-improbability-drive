@@ -709,6 +709,7 @@ You must implement the following task. There is a detailed plan available in the
             reviewer_llm: "gemini-cli".to_string(),
             reviewer_model: self.reviewer_model.clone(),
             max_escalations: self.max_escalations,
+            max_concurrent_reviewers: self.config.planning.max_concurrent_reviewers,
         };
 
         if is_debug() {
@@ -1259,6 +1260,7 @@ You must implement the following task. There is a detailed plan available in the
             reviewer_llm: "gemini-cli".to_string(),
             reviewer_model: self.reviewer_model.clone(),
             max_escalations: self.max_escalations,
+            max_concurrent_reviewers: self.config.planning.max_concurrent_reviewers,
         };
 
         let mut orchestrator = SpawnTeamOrchestrator::new(

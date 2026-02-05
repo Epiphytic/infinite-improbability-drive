@@ -51,6 +51,9 @@ pub struct PlanningConfig {
     /// Reviewer LLM identifier.
     #[serde(default = "default_reviewer_llm")]
     pub reviewer_llm: String,
+    /// Maximum number of concurrent reviewer LLMs in GitHub mode.
+    #[serde(default = "default_max_concurrent_reviewers")]
+    pub max_concurrent_reviewers: u32,
 }
 
 fn default_ping_pong_iterations() -> u32 {
@@ -61,11 +64,16 @@ fn default_reviewer_llm() -> String {
     "gemini-cli".to_string()
 }
 
+fn default_max_concurrent_reviewers() -> u32 {
+    3
+}
+
 impl Default for PlanningConfig {
     fn default() -> Self {
         Self {
             ping_pong_iterations: default_ping_pong_iterations(),
             reviewer_llm: default_reviewer_llm(),
+            max_concurrent_reviewers: default_max_concurrent_reviewers(),
         }
     }
 }
@@ -271,6 +279,7 @@ mod tests {
 
         assert_eq!(config.planning.ping_pong_iterations, 5);
         assert_eq!(config.planning.reviewer_llm, "gemini-cli");
+        assert_eq!(config.planning.max_concurrent_reviewers, 3);
         assert_eq!(config.building.max_parallel, 3);
         assert_eq!(config.building.pr_strategy, PrStrategy::PerTask);
         assert_eq!(config.validation.test_level, TestLevel::Functional);

@@ -46,6 +46,10 @@ pub struct SpawnTeamConfig {
     /// Maximum permission escalations allowed per spawn.
     #[serde(default = "default_max_escalations")]
     pub max_escalations: u32,
+    /// Maximum number of reviewer LLMs running concurrently in GitHub mode.
+    /// Default: 3. Set to 1 for sequential behavior.
+    #[serde(default = "default_max_concurrent_reviewers")]
+    pub max_concurrent_reviewers: u32,
 }
 
 fn default_max_iterations() -> u32 {
@@ -64,6 +68,10 @@ fn default_max_escalations() -> u32 {
     5 // Allow 5 escalations for complex tasks
 }
 
+fn default_max_concurrent_reviewers() -> u32 {
+    3
+}
+
 impl Default for SpawnTeamConfig {
     fn default() -> Self {
         Self {
@@ -74,6 +82,7 @@ impl Default for SpawnTeamConfig {
             reviewer_llm: default_reviewer_llm(),
             reviewer_model: None, // Use CLI default
             max_escalations: default_max_escalations(),
+            max_concurrent_reviewers: default_max_concurrent_reviewers(),
         }
     }
 }
@@ -613,6 +622,12 @@ mod tests {
         assert_eq!(config.primary_llm, "claude-code");
         assert_eq!(config.reviewer_llm, "gemini-cli");
         assert_eq!(config.max_escalations, 5);
+    }
+
+    #[test]
+    fn spawn_team_config_default_max_concurrent_reviewers() {
+        let config = SpawnTeamConfig::default();
+        assert_eq!(config.max_concurrent_reviewers, 3);
     }
 
     #[test]
