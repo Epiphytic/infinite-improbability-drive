@@ -435,44 +435,40 @@ Respond with ONLY a JSON object (no markdown, no explanation):
         );
 
         // Step 3: Run review phases
-        // All 5 phases: Security, TechnicalFeasibility, TaskGranularity,
-        // DependencyCompleteness, GeneralPolish
-        let review_phases = ReviewDomain::all();
-        let phases_to_run = review_phases.len().min(self.config.max_iterations as usize);
-        let mut current_prompt = prompt.to_string();
+        if use_github_reviews {
+            // Parallel review/fix pipeline for GitHub mode
+            let review_results = self.run_parallel_review_fix(
+                prompt,
+                timeout,
+                worktree_path,
+                work_path,
+                extracted_pr_number,
+                &repo,
+            ).await?;
 
-        for (phase_idx, domain) in review_phases.iter().take(phases_to_run).enumerate() {
-            iterations = (phase_idx + 1) as u32;
-            let is_last_phase = phase_idx == phases_to_run - 1;
+            reviews = review_results;
+            iterations = ReviewDomain::all().len() as u32;
 
-            tracing::info!(
-                domain = %domain.as_str(),
-                iteration = iterations,
-                is_last_phase = is_last_phase,
-                use_github_reviews = use_github_reviews,
-                "starting review phase"
-            );
-
-            // Get current diff for this phase - use worktree where feature branch is checked out
-            let diff = self.get_git_diff(worktree_path)?;
-
-            // Run review - method differs based on mode
-            let review_result = if use_github_reviews {
-                // GitHub mode: reviewer creates GitHub review with line comments
-                self.run_github_reviewer(
-                    &current_prompt,
-                    &diff,
-                    timeout,
-                    worktree_path,
-                    *domain,
-                    extracted_pr_number,
-                    &repo,
-                )
-                .await?
+            // Determine final verdict from all reviews
+            final_verdict = if reviews.iter().any(|r| r.verdict == ReviewVerdict::NeedsChanges) {
+                Some(ReviewVerdict::NeedsChanges)
             } else {
-                // PingPong mode: reviewer outputs to stdout
-                // Use worktree_path where feature branch files are available
-                let review = self
+                Some(ReviewVerdict::Approved)
+            };
+        } else {
+            // PingPong mode: keep the sequential approach
+            let review_phases = ReviewDomain::all();
+            let phases_to_run = review_phases.len().min(self.config.max_iterations as usize);
+            let mut current_prompt = prompt.to_string();
+
+            for (phase_idx, domain) in review_phases.iter().take(phases_to_run).enumerate() {
+                iterations = (phase_idx + 1) as u32;
+
+                // Get current diff
+                let diff = self.get_git_diff(worktree_path)?;
+
+                // Run PingPong reviewer
+                let review_result = self
                     .run_reviewer(
                         &current_prompt,
                         &diff,
@@ -483,65 +479,16 @@ Respond with ONLY a JSON object (no markdown, no explanation):
                     )
                     .await?;
 
-                // Append review to PR body for traceability
+                // Append review to PR body
                 if let Some(ref url) = pr_url {
-                    self.append_review_to_pr(url, &review, domain)?;
+                    self.append_review_to_pr(url, &review_result, domain)?;
                 }
 
-                review
-            };
+                reviews.push(review_result.clone());
+                final_verdict = Some(review_result.verdict.clone());
 
-            reviews.push(review_result.clone());
-            final_verdict = Some(review_result.verdict.clone());
-
-            // If review requested changes, run coder to fix
-            if review_result.verdict == ReviewVerdict::NeedsChanges {
-                tracing::info!(
-                    domain = %domain.as_str(),
-                    suggestions = review_result.suggestions.len(),
-                    "reviewer requested changes, running coder to fix"
-                );
-
-                if use_github_reviews {
-                    // GitHub mode: resolve each comment with commits
-                    let pending_comments = self.get_pending_review_comments(
-                        extracted_pr_number,
-                        &repo,
-                        work_path,
-                    )?;
-
-                    if pending_comments.is_empty() {
-                        // Reviewer said NEEDS CHANGES but didn't post line-specific comments.
-                        // This means the feedback is general (in the PR comment body).
-                        // We'll continue to the next review phase since we can't auto-fix
-                        // without specific file/line guidance.
-                        tracing::warn!(
-                            domain = %domain.as_str(),
-                            "reviewer requested changes but no line-specific comments found - continuing to next phase"
-                        );
-                    } else {
-                        for comment in pending_comments {
-                            tracing::info!(
-                                comment_id = comment.id,
-                                path = %comment.path,
-                                "resolving GitHub review comment"
-                            );
-
-                            // Use worktree_path for commits to go to the feature branch
-                            self.resolve_github_comment(
-                                &current_prompt,
-                                timeout,
-                                worktree_path,
-                                extracted_pr_number,
-                                &repo,
-                                comment,
-                            )
-                            .await?;
-                        }
-                    }
-                } else {
-                    // PingPong mode: run fix phase
-                    // Use worktree_path for commits to go to the feature branch
+                // If needs changes, run fix
+                if review_result.verdict == ReviewVerdict::NeedsChanges {
                     let _fix_result = self
                         .run_fix(
                             &current_prompt,
@@ -549,34 +496,14 @@ Respond with ONLY a JSON object (no markdown, no explanation):
                             timeout,
                             worktree_path,
                             iterations,
-                            None, // Use existing branch
+                            None,
                         )
                         .await?;
+
+                    current_prompt = FixPromptBuilder::new(prompt)
+                        .with_suggestions(review_result.suggestions.clone())
+                        .build();
                 }
-
-                // Update prompt with suggestions for next phase
-                current_prompt = FixPromptBuilder::new(prompt)
-                    .with_suggestions(review_result.suggestions.clone())
-                    .build();
-            } else {
-                tracing::info!(
-                    domain = %domain.as_str(),
-                    "reviewer approved this phase"
-                );
-            }
-
-            // Special handling for General Polish phase (last phase)
-            if is_last_phase && use_github_reviews {
-                // GitHub mode: check for user comments and assess if work is complete
-                // IMPORTANT: Use worktree_path (not work_path) so commits go to the PR branch
-                self.handle_general_polish_github(
-                    &current_prompt,
-                    timeout,
-                    worktree_path,
-                    extracted_pr_number,
-                    &repo,
-                )
-                .await?;
             }
         }
 
