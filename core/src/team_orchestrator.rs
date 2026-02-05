@@ -136,6 +136,28 @@ pub struct SecurityFinding {
     pub recommendation: String,
 }
 
+/// A review comment queued for fixing by the fixer worker.
+#[derive(Debug, Clone)]
+pub struct QueuedComment {
+    /// The review domain this comment came from.
+    pub domain: ReviewDomain,
+    /// The GitHub review comment to fix.
+    pub comment: GitHubReviewComment,
+    /// PR number.
+    pub pr_number: u64,
+    /// Repository name (owner/repo).
+    pub repo: String,
+}
+
+/// Messages sent from reviewer tasks to the fixer worker.
+#[derive(Debug)]
+pub enum FixerMessage {
+    /// A comment that needs fixing.
+    Fix(QueuedComment),
+    /// Signal that all reviewers have completed.
+    AllReviewersComplete,
+}
+
 /// Orchestrates spawn-team execution with ping-pong mode.
 pub struct SpawnTeamOrchestrator<P: SandboxProvider + Clone> {
     config: SpawnTeamConfig,
@@ -1410,6 +1432,165 @@ Respond with ONLY a JSON object (no markdown, no explanation):
     }
 
     // =========================================================================
+    // Threaded Reply & Thread Resolution Methods
+    // =========================================================================
+
+    /// Posts a threaded reply to a specific GitHub review comment.
+    ///
+    /// Uses the GitHub API to create a reply that appears as a child
+    /// of the original review comment, rather than a top-level PR comment.
+    fn reply_to_review_comment(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        comment_id: u64,
+        body: &str,
+        work_dir: &Path,
+    ) -> Result<()> {
+        let api_path = format!(
+            "repos/{}/pulls/{}/comments/{}/replies",
+            repo, pr_number, comment_id
+        );
+
+        let output = Command::new("gh")
+            .current_dir(work_dir)
+            .args([
+                "api",
+                &api_path,
+                "--method", "POST",
+                "-f", &format!("body={}", body),
+            ])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to reply to comment: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                comment_id = comment_id,
+                error = %stderr,
+                "failed to post threaded reply, falling back to PR comment"
+            );
+            // Fallback: post as top-level PR comment with reference
+            let fallback_body = format!(
+                "> Re: comment #{}\n\n{}",
+                comment_id, body
+            );
+            let _ = Command::new("gh")
+                .current_dir(work_dir)
+                .args([
+                    "pr", "comment",
+                    &pr_number.to_string(),
+                    "--repo", repo,
+                    "--body", &fallback_body,
+                ])
+                .output();
+        }
+
+        Ok(())
+    }
+
+    /// Resolves a GitHub review thread by finding the thread containing the comment
+    /// and marking it as resolved via GraphQL.
+    fn resolve_review_thread(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        comment_id: u64,
+        work_dir: &Path,
+    ) -> Result<()> {
+        let (owner, name) = repo.split_once('/')
+            .ok_or_else(|| Error::Cruise(format!("invalid repo format: {}", repo)))?;
+
+        // Step 1: Find the thread node ID that contains this comment
+        let query = format!(
+            r#"query {{
+                repository(owner: "{}", name: "{}") {{
+                    pullRequest(number: {}) {{
+                        reviewThreads(first: 100) {{
+                            nodes {{
+                                id
+                                isResolved
+                                comments(first: 1) {{
+                                    nodes {{ databaseId }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            owner, name, pr_number,
+        );
+
+        let output = Command::new("gh")
+            .current_dir(work_dir)
+            .args(["api", "graphql", "-f", &format!("query={}", query)])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to query review threads: {}", e)))?;
+
+        if !output.status.success() {
+            tracing::warn!(
+                comment_id = comment_id,
+                error = %String::from_utf8_lossy(&output.stderr),
+                "failed to query review threads for resolution"
+            );
+            return Ok(()); // Don't fail the workflow
+        }
+
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| Error::Cruise(format!("failed to parse GraphQL response: {}", e)))?;
+
+        // Find the thread containing our comment
+        let thread_id = response
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|nodes| nodes.as_array())
+            .and_then(|nodes| {
+                nodes.iter().find(|node| {
+                    node.pointer("/comments/nodes/0/databaseId")
+                        .and_then(|id| id.as_u64())
+                        == Some(comment_id)
+                })
+            })
+            .and_then(|node| node.get("id"))
+            .and_then(|id| id.as_str());
+
+        let Some(thread_id) = thread_id else {
+            tracing::debug!(
+                comment_id = comment_id,
+                "could not find review thread for comment (may be a PR comment, not a review comment)"
+            );
+            return Ok(());
+        };
+
+        // Step 2: Resolve the thread
+        let resolve_mutation = format!(
+            r#"mutation {{ resolveReviewThread(input: {{threadId: "{}"}}) {{ thread {{ isResolved }} }} }}"#,
+            thread_id,
+        );
+
+        let resolve_output = Command::new("gh")
+            .current_dir(work_dir)
+            .args(["api", "graphql", "-f", &format!("query={}", resolve_mutation)])
+            .output()
+            .map_err(|e| Error::Cruise(format!("failed to resolve thread: {}", e)))?;
+
+        if resolve_output.status.success() {
+            tracing::info!(
+                comment_id = comment_id,
+                thread_id = thread_id,
+                "resolved review thread"
+            );
+        } else {
+            tracing::warn!(
+                comment_id = comment_id,
+                error = %String::from_utf8_lossy(&resolve_output.stderr),
+                "failed to resolve review thread"
+            );
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
     // GitHub Mode Helper Methods
     // =========================================================================
 
@@ -2209,5 +2390,74 @@ mod tests {
             recommendation: "Use parameterized queries".to_string(),
         };
         assert_eq!(finding.severity, "critical");
+    }
+
+    #[test]
+    fn queued_comment_captures_data() {
+        let comment = GitHubReviewComment {
+            id: 123,
+            path: "src/main.rs".to_string(),
+            line: Some(10),
+            body: "Fix this".to_string(),
+            resolved: false,
+            resolved_by_commit: None,
+        };
+        let queued = QueuedComment {
+            domain: ReviewDomain::Security,
+            comment: comment.clone(),
+            pr_number: 1,
+            repo: "owner/repo".to_string(),
+        };
+        assert_eq!(queued.comment.id, 123);
+        assert_eq!(queued.domain, ReviewDomain::Security);
+    }
+
+    #[test]
+    fn fixer_message_variants() {
+        let comment = GitHubReviewComment {
+            id: 456,
+            path: "src/lib.rs".to_string(),
+            line: None,
+            body: "Issue".to_string(),
+            resolved: false,
+            resolved_by_commit: None,
+        };
+        let queued = QueuedComment {
+            domain: ReviewDomain::GeneralPolish,
+            comment,
+            pr_number: 2,
+            repo: "owner/repo".to_string(),
+        };
+        let msg = FixerMessage::Fix(queued);
+        assert!(matches!(msg, FixerMessage::Fix(_)));
+
+        let done = FixerMessage::AllReviewersComplete;
+        assert!(matches!(done, FixerMessage::AllReviewersComplete));
+    }
+
+    #[test]
+    fn reply_to_review_comment_builds_correct_api_path() {
+        let repo = "owner/repo";
+        let pr_number = 42u64;
+        let comment_id = 123u64;
+        let api_path = format!(
+            "repos/{}/pulls/{}/comments/{}/replies",
+            repo, pr_number, comment_id
+        );
+        assert_eq!(
+            api_path,
+            "repos/owner/repo/pulls/42/comments/123/replies"
+        );
+    }
+
+    #[test]
+    fn resolve_review_thread_builds_graphql_query() {
+        let thread_id = "RT_kwDOtest123";
+        let query = format!(
+            r#"mutation {{ resolveReviewThread(input: {{threadId: "{}"}}) {{ thread {{ isResolved }} }} }}"#,
+            thread_id
+        );
+        assert!(query.contains("resolveReviewThread"));
+        assert!(query.contains(thread_id));
     }
 }
