@@ -69,6 +69,18 @@ pub struct CruiseTask {
     /// Error message if blocked.
     #[serde(default)]
     pub error: Option<String>,
+    /// Required permissions for the LLM to execute this task.
+    /// e.g., ["Read", "Write", "Edit", "Bash"]
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// CLI parameters for launching the LLM for this task.
+    /// e.g., "--model opus --allowedTools Read,Write,Edit"
+    #[serde(default)]
+    pub cli_params: Option<String>,
+    /// Which spawn/spawn-team instance this task belongs to.
+    /// Tasks with the same spawn_instance will be executed together.
+    #[serde(default)]
+    pub spawn_instance: Option<String>,
 }
 
 impl CruiseTask {
@@ -87,6 +99,9 @@ impl CruiseTask {
             started_at: None,
             finished_at: None,
             error: None,
+            permissions: Vec::new(),
+            cli_params: None,
+            spawn_instance: None,
         }
     }
 
@@ -114,6 +129,24 @@ impl CruiseTask {
         self
     }
 
+    /// Sets the required permissions.
+    pub fn with_permissions(mut self, permissions: Vec<String>) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// Sets the CLI parameters.
+    pub fn with_cli_params(mut self, cli_params: impl Into<String>) -> Self {
+        self.cli_params = Some(cli_params.into());
+        self
+    }
+
+    /// Sets the spawn instance.
+    pub fn with_spawn_instance(mut self, instance: impl Into<String>) -> Self {
+        self.spawn_instance = Some(instance.into());
+        self
+    }
+
     /// Checks if this task is ready to execute (all dependencies completed).
     pub fn is_ready(&self, completed_tasks: &HashSet<String>) -> bool {
         self.status == TaskStatus::Pending
@@ -121,6 +154,38 @@ impl CruiseTask {
                 .blocked_by
                 .iter()
                 .all(|dep| completed_tasks.contains(dep))
+    }
+}
+
+/// A spawn/spawn-team instance that groups related tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnInstance {
+    /// Unique instance identifier (e.g., "SPAWN-001").
+    pub id: String,
+    /// Human-readable name for the instance.
+    pub name: String,
+    /// Whether this uses spawn-team (ping-pong mode) or single spawn.
+    #[serde(default)]
+    pub use_spawn_team: bool,
+    /// CLI parameters for launching this instance.
+    pub cli_params: String,
+    /// Required permissions for this instance.
+    pub permissions: Vec<String>,
+    /// Task IDs that belong to this instance.
+    pub task_ids: Vec<String>,
+}
+
+impl SpawnInstance {
+    /// Creates a new spawn instance.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            use_spawn_team: false,
+            cli_params: String::new(),
+            permissions: Vec::new(),
+            task_ids: Vec::new(),
+        }
     }
 }
 
@@ -141,6 +206,9 @@ pub struct CruisePlan {
     /// Number of ping-pong iterations used to create plan.
     #[serde(default)]
     pub planning_iterations: u32,
+    /// Spawn instances that group tasks for execution.
+    #[serde(default)]
+    pub spawn_instances: Vec<SpawnInstance>,
 }
 
 impl CruisePlan {
@@ -153,6 +221,7 @@ impl CruisePlan {
             tasks: Vec::new(),
             risks: Vec::new(),
             planning_iterations: 0,
+            spawn_instances: Vec::new(),
         }
     }
 

@@ -3,6 +3,7 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
+use serde_json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -41,7 +42,11 @@ impl GeminiRunner {
     /// Builds the command arguments for spawning Gemini.
     fn build_args(&self, config: &LLMSpawnConfig) -> Vec<String> {
         let mut args = vec![
-            "--non-interactive".to_string(),
+            // Use --yolo for auto-approval (--approval-mode plan requires experimental flag)
+            "--yolo".to_string(),
+            // Use stream-json for structured output that shows tool calls
+            "--output-format".to_string(),
+            "stream-json".to_string(),
         ];
 
         // Add model if specified
@@ -50,16 +55,13 @@ impl GeminiRunner {
             args.push(model.clone());
         }
 
-        // Add sandbox mode based on manifest
-        if !config.manifest.allowed_commands.is_empty() {
-            args.push("--sandbox".to_string());
-            args.push("permissive".to_string());
-        } else {
-            args.push("--sandbox".to_string());
-            args.push("strict".to_string());
+        // Add allowed tools from manifest (required for GitHub access, etc.)
+        if !config.manifest.allowed_tools.is_empty() {
+            args.push("--allowed-tools".to_string());
+            args.push(config.manifest.allowed_tools.join(","));
         }
 
-        // Add the prompt
+        // Add the prompt using --prompt flag
         args.push("--prompt".to_string());
         args.push(config.prompt.clone());
 
@@ -85,6 +87,8 @@ impl LLMRunner for GeminiRunner {
         let mut child = Command::new(&self.cli_path)
             .args(&args)
             .current_dir(&config.working_dir)
+            // Disable fork-join plugin to avoid conflicts with cruise-control
+            .env("FORK_JOIN_DISABLED", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -157,73 +161,70 @@ impl LLMRunner for GeminiRunner {
 }
 
 impl GeminiRunner {
-    /// Parses an output line to detect tool calls and file operations.
+    /// Parses an output line (JSON from stream-json format) to detect tool calls and file operations.
     fn parse_output_line(&self, line: &str) -> LLMOutput {
-        // Detect file reads (Gemini uses different patterns)
-        if line.contains("reading") && line.contains("file") {
-            if let Some(path) = self.extract_path(line) {
-                return LLMOutput::FileRead(path.into());
+        // Try to parse as JSON first (stream-json format)
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            // Check for tool use in assistant messages
+            // Gemini may use different JSON structure - check for common patterns
+            if let Some(tool_call) = json.get("tool_call").or(json.get("function_call")) {
+                let tool_name = tool_call
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if let Some(args) = tool_call.get("args").or(tool_call.get("arguments")) {
+                    let file_path = args.get("path").or(args.get("file_path")).and_then(|p| p.as_str());
+
+                    match tool_name.as_str() {
+                        "read_file" | "ReadFile" | "Read" => {
+                            if let Some(path) = file_path {
+                                return LLMOutput::FileRead(path.into());
+                            }
+                        }
+                        "write_file" | "WriteFile" | "Write" | "edit_file" | "EditFile" | "Edit" => {
+                            if let Some(path) = file_path {
+                                return LLMOutput::FileWrite(path.into());
+                            }
+                        }
+                        _ => {
+                            return LLMOutput::ToolCall {
+                                tool: tool_name,
+                                args: args.to_string(),
+                            };
+                        }
+                    }
+                }
+
+                return LLMOutput::ToolCall {
+                    tool: tool_name,
+                    args: String::new(),
+                };
             }
+
+            // Check for tool results (file operations completed)
+            if let Some(result) = json.get("tool_result").or(json.get("function_result")) {
+                if let Some(file_path) = result.get("file_path").and_then(|p| p.as_str()) {
+                    let result_type = result.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match result_type {
+                        "write" | "create" | "edit" => {
+                            return LLMOutput::FileWrite(file_path.into());
+                        }
+                        "read" => {
+                            return LLMOutput::FileRead(file_path.into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // For other JSON messages, return as stdout
+            return LLMOutput::Stdout(line.to_string());
         }
 
-        // Detect file writes
-        if line.contains("writing") && line.contains("file") {
-            if let Some(path) = self.extract_path(line) {
-                return LLMOutput::FileWrite(path.into());
-            }
-        }
-
-        // Detect tool/function calls
-        if line.contains("function_call") || line.contains("tool_use") {
-            if let Some((tool, args)) = self.extract_function_call(line) {
-                return LLMOutput::ToolCall { tool, args };
-            }
-        }
-
+        // Fallback: not JSON, return as raw output
         LLMOutput::Stdout(line.to_string())
-    }
-
-    /// Extracts a file path from output.
-    fn extract_path(&self, line: &str) -> Option<String> {
-        // Look for paths in quotes
-        if let Some(start) = line.find('"') {
-            if let Some(end) = line[start + 1..].find('"') {
-                let path = &line[start + 1..start + 1 + end];
-                if path.contains('/') || path.contains('\\') {
-                    return Some(path.to_string());
-                }
-            }
-        }
-
-        if let Some(start) = line.find('\'') {
-            if let Some(end) = line[start + 1..].find('\'') {
-                let path = &line[start + 1..start + 1 + end];
-                if path.contains('/') || path.contains('\\') {
-                    return Some(path.to_string());
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Extracts a function call from output.
-    fn extract_function_call(&self, line: &str) -> Option<(String, String)> {
-        // Pattern: "function_call: name(args)" or similar
-        if line.contains("function_call:") {
-            let parts: Vec<&str> = line.split("function_call:").collect();
-            if parts.len() > 1 {
-                let rest = parts[1].trim();
-                if let Some(paren) = rest.find('(') {
-                    let name = rest[..paren].trim().to_string();
-                    let end = rest.rfind(')').unwrap_or(rest.len());
-                    let args = rest[paren + 1..end].to_string();
-                    return Some((name, args));
-                }
-            }
-        }
-
-        None
     }
 }
 
@@ -243,11 +244,11 @@ mod tests {
 
         let args = runner.build_args(&config);
 
-        assert!(args.contains(&"--non-interactive".to_string()));
+        assert!(args.contains(&"--yolo".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"--prompt".to_string()));
         assert!(args.contains(&"test prompt".to_string()));
-        assert!(args.contains(&"--sandbox".to_string()));
-        assert!(args.contains(&"strict".to_string()));
     }
 
     #[test]
@@ -267,26 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_runner_uses_permissive_sandbox_with_commands() {
-        let runner = GeminiRunner::new();
-        let mut manifest = crate::sandbox::SandboxManifest::default();
-        manifest.allowed_commands = vec!["npm test".to_string()];
-
-        let config = LLMSpawnConfig {
-            prompt: "test".to_string(),
-            working_dir: "/tmp".into(),
-            manifest,
-            model: None,
-        };
-
-        let args = runner.build_args(&config);
-
-        assert!(args.contains(&"--sandbox".to_string()));
-        assert!(args.contains(&"permissive".to_string()));
-    }
-
-    #[test]
-    fn gemini_runner_parses_stdout_line() {
+    fn gemini_runner_parses_non_json_as_stdout() {
         let runner = GeminiRunner::new();
 
         let output = runner.parse_output_line("Just some regular output");
@@ -294,31 +276,42 @@ mod tests {
     }
 
     #[test]
-    fn gemini_runner_detects_file_read() {
+    fn gemini_runner_parses_json_write_tool_call() {
         let runner = GeminiRunner::new();
 
-        let output = runner.parse_output_line("reading file \"/src/main.rs\"");
-        assert!(matches!(output, LLMOutput::FileRead(_)));
-    }
-
-    #[test]
-    fn gemini_runner_detects_file_write() {
-        let runner = GeminiRunner::new();
-
-        let output = runner.parse_output_line("writing file \"/src/new.rs\"");
-        assert!(matches!(output, LLMOutput::FileWrite(_)));
-    }
-
-    #[test]
-    fn gemini_runner_detects_function_call() {
-        let runner = GeminiRunner::new();
-
-        let output = runner.parse_output_line("function_call: execute_code(print('hello'))");
-        if let LLMOutput::ToolCall { tool, args } = output {
-            assert_eq!(tool, "execute_code");
-            assert_eq!(args, "print('hello')");
+        let json = r#"{"tool_call":{"name":"write_file","args":{"path":"/src/main.rs","content":"test"}}}"#;
+        let output = runner.parse_output_line(json);
+        if let LLMOutput::FileWrite(path) = output {
+            assert_eq!(path.to_string_lossy(), "/src/main.rs");
         } else {
-            panic!("Expected ToolCall");
+            panic!("Expected FileWrite, got {:?}", output);
+        }
+    }
+
+    #[test]
+    fn gemini_runner_parses_json_read_tool_call() {
+        let runner = GeminiRunner::new();
+
+        let json = r#"{"tool_call":{"name":"read_file","args":{"path":"/src/lib.rs"}}}"#;
+        let output = runner.parse_output_line(json);
+        if let LLMOutput::FileRead(path) = output {
+            assert_eq!(path.to_string_lossy(), "/src/lib.rs");
+        } else {
+            panic!("Expected FileRead, got {:?}", output);
+        }
+    }
+
+    #[test]
+    fn gemini_runner_parses_json_generic_tool_call() {
+        let runner = GeminiRunner::new();
+
+        let json = r#"{"tool_call":{"name":"execute_shell","args":{"command":"ls -la"}}}"#;
+        let output = runner.parse_output_line(json);
+        if let LLMOutput::ToolCall { tool, args } = output {
+            assert_eq!(tool, "execute_shell");
+            assert!(args.contains("ls -la"));
+        } else {
+            panic!("Expected ToolCall, got {:?}", output);
         }
     }
 

@@ -13,8 +13,19 @@ This plugin provides a `spawn` skill that enables host LLMs to delegate complex 
 | Document | Human | LLM (AISP) |
 |----------|-------|------------|
 | Architecture | [docs/architecture.md](./docs/architecture.md) | [docs/architecture.aisp](./docs/architecture.aisp) |
+| Spawn-Team | [docs/spawn-team.md](./docs/spawn-team.md) | - |
+| Cruise-Control | [docs/cruise-control.md](./docs/cruise-control.md) | - |
 | Configuration | [docs/configuration.md](./docs/configuration.md) | [docs/configuration.aisp](./docs/configuration.aisp) |
 | Watcher Agent | [agents/watcher.md](./agents/watcher.md) | [agents/watcher.aisp](./agents/watcher.aisp) |
+| Agents | [AGENTS.md](./AGENTS.md) | - |
+
+### Design Documents
+
+| Document | Description |
+|----------|-------------|
+| [Cruise-Control Design](./docs/plans/2026-02-01-cruise-control-design.md) | Main cruise-control design |
+| [Planner Design](./docs/plans/2026-02-01-cruise-planner-design.md) | Plan phase design |
+| [E2E Testing Design](./docs/plans/2026-02-02-e2e-testing-design.md) | End-to-end testing infrastructure |
 
 ## Architecture
 
@@ -24,6 +35,35 @@ Host LLM Session → spawn command → Watcher Agent → Sandboxed LLM Instance
                               (provisions, monitors,
                                recovers, creates PR)
 ```
+
+### Spawn-Team Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SpawnTeamOrchestrator                        │
+├─────────────────────────────────────────────────────────────────┤
+│  Modes: Sequential | PingPong | GitHub (default)               │
+│                                                                 │
+│  Primary (Claude) ◄──► Reviewer (Gemini)                       │
+│         │                      │                                │
+│         ▼                      ▼                                │
+│  Commits + Push        PR Comments / Review Feedback            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Cruise-Control Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        cruise-control                           │
+├─────────────────────────────────────────────────────────────────┤
+│  PHASE 1: PLAN (spawn-team with phased reviews)                │
+│  PHASE 2: BUILD (parallel task execution)                      │
+│  PHASE 3: VALIDATE (audit against plan)                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+See [docs/cruise-control.md](./docs/cruise-control.md) for full details.
 
 ### Key Components
 
@@ -38,6 +78,9 @@ Host LLM Session → spawn command → Watcher Agent → Sandboxed LLM Instance
 | `PermissionDetector` | `core/src/permissions.rs` | Pattern-matches permission errors |
 | `PRManager` | `core/src/pr.rs` | Creates PRs, handles merge conflicts |
 | `SecretsManager` | `core/src/secrets.rs` | Secret injection & log redaction |
+| `CruiseRunner` | `core/src/cruise/runner.rs` | Orchestrates cruise-control workflow |
+| `Planner` | `core/src/cruise/planner.rs` | Plan generation with phased reviews |
+| `SpawnTeamOrchestrator` | `core/src/team_orchestrator.rs` | Multi-LLM coordination |
 
 ## Directory Structure
 
@@ -81,6 +124,43 @@ infinite-improbability-drive/
 ```
 
 ## Development Guidelines
+
+### Test-Driven Development (REQUIRED)
+
+**All development on this project MUST follow Test-Driven Development (TDD).**
+
+#### TDD Workflow
+
+1. **Write failing tests first** - Define expected behavior before implementation
+2. **Implement minimal code to pass** - Only write enough code to make tests green
+3. **Refactor while maintaining green tests** - Improve code quality with test safety net
+
+#### Verification Standards
+
+**No feature is considered complete until it has provable, verifiable tests that it works.**
+
+Before any work is considered done:
+- [ ] Unit tests exist and pass for all new code
+- [ ] Integration tests verify component interactions
+- [ ] E2E tests validate full workflows (where applicable)
+- [ ] `cargo test` passes with no failures
+- [ ] Documentation updated if behavior changed
+
+#### Test Commands
+
+```bash
+# Run all tests (required before any commit)
+cargo test
+
+# Run specific test module
+cargo test cruise::
+
+# Run E2E tests (slower, requires real LLMs)
+cargo test --test e2e
+
+# Run tests with output
+cargo test -- --nocapture
+```
 
 ### Rust Conventions
 
@@ -135,9 +215,27 @@ denied_tools = ["Task"]          # No recursive spawning
 max_permission_escalations = 1
 
 [spawn-team]
-coordination = "sequential"      # or "ping-pong"
+mode = "github"                  # "sequential", "pingpong", or "github"
 max_iterations = 3
+primary_llm = "claude-code"
 reviewer_llm = "gemini-cli"
+max_escalations = 5
+
+[cruise-control.planning]
+ping_pong_iterations = 5
+reviewer_llm = "gemini-cli"
+
+[cruise-control.building]
+max_parallel = 3
+pr_strategy = "per-task"         # "per-task", "batch", or "single"
+
+[cruise-control.validation]
+test_level = "functional"        # "basic", "functional", or "strict"
+
+[cruise-control.timeouts]
+idle_timeout_secs = 300          # 5 minutes
+total_timeout_secs = 3600        # 1 hour
+planning_idle_timeout_secs = 600 # 10 minutes
 ```
 
 ## Key Design Decisions
@@ -150,34 +248,50 @@ reviewer_llm = "gemini-cli"
 | Timeout strategy | Activity-based | Won't kill thinking LLMs, catches hangs |
 | Change integration | PR-based | Host retains control over merges |
 | Logging | Tiered | Disk efficiency with debug capability |
+| Spawn-team default | GitHub mode | Full traceability, human-readable reviews on PRs |
+| Review phases | 5 specialized domains | Security, feasibility, granularity, dependencies, polish |
+| Cruise-control plans | Beads issues + markdown | Machine-readable source of truth, human-readable view |
+| Development process | Test-Driven Development | Provable correctness, prevents regressions |
 
 ## Implementation Phases
 
-### Phase 1: Foundation (Current)
-- [ ] Update rosetta-aisp-llm to v0.3.0
-- [ ] Create plugin structure
-- [ ] Implement SandboxProvider trait + worktree
-- [ ] Basic spawn command
+### Phase 1: Foundation ✓
+- [x] Create plugin structure
+- [x] Implement SandboxProvider trait + worktree
+- [x] Basic spawn command
 
-### Phase 2: Watcher Agent
-- [ ] LLM-assisted task evaluation
-- [ ] Progress monitoring
-- [ ] Permission error detection
+### Phase 2: Watcher Agent ✓
+- [x] LLM-assisted task evaluation
+- [x] Progress monitoring
+- [x] Permission error detection
 
-### Phase 3: Recovery & Integration
-- [ ] Recovery strategies
-- [ ] PR creation
-- [ ] Secret handling
+### Phase 3: Recovery & Integration ✓
+- [x] Recovery strategies
+- [x] PR creation
+- [x] Secret handling
 
-### Phase 4: Spawn-Team
-- [ ] Sequential coordination
-- [ ] Ping-pong mode
-- [ ] Gemini-cli runner
+### Phase 4: Spawn-Team ✓
+- [x] Sequential coordination
+- [x] PingPong mode
+- [x] GitHub mode (default)
+- [x] Gemini-cli runner
 
-### Phase 5: Polish
-- [ ] Documentation
-- [ ] Tests
-- [ ] Configuration validation
+### Phase 5: Cruise-Control ✓
+- [x] Planner with phased reviews
+- [x] CruiseRunner for full workflows
+- [x] Beads integration
+- [x] Observability capture
+
+### Phase 6: E2E Testing (Current)
+- [x] E2E test harness
+- [x] GitHub repo lifecycle
+- [x] Fixture-based test definitions
+- [ ] Complete test coverage
+
+### Future Work
+- [ ] Docker-based sandboxing
+- [ ] Parallel task execution in build phase
+- [ ] Advanced validation (curl tests, audit reports)
 
 ## Dependencies
 
@@ -201,6 +315,62 @@ git2 = "0.19"               # Git operations
 - **Path isolation**: Sandboxed LLMs cannot access `$HOME`, config files, or other repos
 - **Restricted `$PATH`**: Bash commands run with limited command availability
 - **Network restrictions**: Only allowed command patterns have network access
+
+## Gemini CLI: Asking Users Questions
+
+Reference: `google-gemini/gemini-cli` — `packages/core/src/confirmation-bus/types.ts`, `packages/cli/src/ui/components/AskUserDialog.test.tsx`
+
+### Question Types
+
+```typescript
+enum QuestionType {
+  CHOICE = 'choice',   // Multiple-choice with selectable options (default)
+  TEXT = 'text',        // Free-form text input
+  YESNO = 'yesno',     // Binary Yes/No
+}
+```
+
+### Question Interface
+
+```typescript
+interface QuestionOption {
+  label: string;        // Display text (1-5 words)
+  description: string;  // Brief explanation
+}
+
+interface Question {
+  question: string;          // Full question text, should end with "?"
+  header: string;            // Short chip/tag label (max 16 chars), e.g. "Auth method"
+  type?: QuestionType;       // Defaults to 'choice'
+  options?: QuestionOption[];// Required for 'choice', ignored for 'text'/'yesno'
+  multiSelect?: boolean;     // Allow multiple selections ('choice' only)
+  placeholder?: string;      // Hint text for text input or the "Other" custom input
+}
+```
+
+### Tool Schema (AskUserTool)
+
+- Tool name: `ask_user`
+- Accepts 1–4 questions per invocation
+- An "Other" free-text option is automatically appended to every choice list
+- Answers returned as `{ [questionIndex: string]: string }` (e.g. `{ '0': 'OAuth 2.0', '1': 'Vite' }`)
+- Cancellation sets `cancelled: true` on the response
+
+### Communication Flow
+
+Uses a `MessageBus` pub/sub pattern:
+1. Tool sends `ASK_USER_REQUEST` with `questions[]` + `correlationId`
+2. UI renders `AskUserDialog` component
+3. UI sends back `ASK_USER_RESPONSE` with `answers` dict (or `cancelled: true`)
+
+### UI Behaviors
+
+- **Single select**: Up/Down to navigate options, Enter to select and submit
+- **Multi-select**: Enter toggles items on/off, navigate to "Done" row and Enter to submit
+- **Type-to-jump**: Typing any unbound character jumps to the "Other" custom input and starts filling it
+- **Multi-question navigation**: Left/Right arrow keys move between questions
+- **Review tab**: Automatically shown as final tab when >1 question. Displays all answers, warns about unanswered questions, Enter submits all
+- **Scroll arrows**: Shown when options overflow available height (unless using alternate buffer)
 
 ## Common Tasks
 

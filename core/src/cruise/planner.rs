@@ -4,7 +4,6 @@
 //! dependency-aware plans as beads issues.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
@@ -12,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PlanningConfig;
 use super::result::PlanResult;
-use super::task::{CruisePlan, CruiseTask, TaskComplexity, TaskStatus};
+use super::task::{CruisePlan, CruiseTask, TaskComplexity};
 use crate::error::{Error, Result};
 
 /// Review phase for plan iteration.
@@ -125,6 +124,7 @@ impl Planner {
             duration: start.elapsed(),
             plan_file: None,
             error: Some("Planner not yet integrated with spawn-team".to_string()),
+            observability: None,
         })
     }
 }
@@ -137,6 +137,23 @@ struct PlanJson {
     tasks: Vec<TaskJson>,
     #[serde(default)]
     risks: Vec<String>,
+    #[serde(default)]
+    spawn_instances: Vec<SpawnInstanceJson>,
+}
+
+/// Intermediate struct for parsing spawn instance JSON.
+#[derive(Debug, Deserialize)]
+struct SpawnInstanceJson {
+    id: String,
+    name: String,
+    #[serde(default)]
+    use_spawn_team: bool,
+    #[serde(default)]
+    cli_params: String,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    task_ids: Vec<String>,
 }
 
 /// Intermediate struct for parsing task JSON.
@@ -153,6 +170,12 @@ struct TaskJson {
     complexity: String,
     #[serde(default)]
     acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    cli_params: Option<String>,
+    #[serde(default)]
+    spawn_instance: Option<String>,
 }
 
 fn default_complexity() -> String {
@@ -178,6 +201,18 @@ pub fn parse_plan_json(output: &str) -> Result<CruisePlan> {
     plan.overview = parsed.overview;
     plan.risks = parsed.risks;
 
+    // Parse spawn instances
+    for instance_json in parsed.spawn_instances {
+        plan.spawn_instances.push(super::task::SpawnInstance {
+            id: instance_json.id,
+            name: instance_json.name,
+            use_spawn_team: instance_json.use_spawn_team,
+            cli_params: instance_json.cli_params,
+            permissions: instance_json.permissions,
+            task_ids: instance_json.task_ids,
+        });
+    }
+
     for task_json in parsed.tasks {
         let complexity = match task_json.complexity.to_lowercase().as_str() {
             "low" => TaskComplexity::Low,
@@ -192,6 +227,9 @@ pub fn parse_plan_json(output: &str) -> Result<CruisePlan> {
 
         task.component = task_json.component;
         task.acceptance_criteria = task_json.acceptance_criteria;
+        task.permissions = task_json.permissions;
+        task.cli_params = task_json.cli_params;
+        task.spawn_instance = task_json.spawn_instance;
 
         plan.tasks.push(task);
     }
@@ -263,91 +301,6 @@ pub fn validate_plan(plan: &CruisePlan) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Writes a CruisePlan as beads issues to the given directory.
-pub fn plan_to_beads(plan: &CruisePlan, beads_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    // Create .beads directory if needed
-    fs::create_dir_all(beads_dir)
-        .map_err(|e| Error::Cruise(format!("Failed to create beads directory: {}", e)))?;
-
-    let mut written_files = Vec::new();
-
-    for task in &plan.tasks {
-        let filename = format!("{}.md", task.id);
-        let filepath = beads_dir.join(&filename);
-
-        let content = format_beads_issue(task);
-
-        fs::write(&filepath, content)
-            .map_err(|e| Error::Cruise(format!("Failed to write {}: {}", filename, e)))?;
-
-        written_files.push(filepath);
-    }
-
-    Ok(written_files)
-}
-
-/// Formats a CruiseTask as a beads issue markdown file.
-fn format_beads_issue(task: &CruiseTask) -> String {
-    let mut content = String::new();
-
-    // YAML frontmatter
-    content.push_str("---\n");
-    content.push_str(&format!("id: {}\n", task.id));
-    content.push_str(&format!("subject: {}\n", task.subject));
-    content.push_str(&format!("status: {}\n", format_status(&task.status)));
-
-    if !task.blocked_by.is_empty() {
-        content.push_str("blockedBy:\n");
-        for dep in &task.blocked_by {
-            content.push_str(&format!("  - {}\n", dep));
-        }
-    } else {
-        content.push_str("blockedBy: []\n");
-    }
-
-    if let Some(component) = &task.component {
-        content.push_str(&format!("component: {}\n", component));
-    }
-
-    content.push_str(&format!(
-        "complexity: {}\n",
-        format_complexity(&task.complexity)
-    ));
-    content.push_str("---\n\n");
-
-    // Body
-    content.push_str(&format!("# {}\n\n", task.subject));
-    content.push_str(&task.description);
-    content.push('\n');
-
-    if !task.acceptance_criteria.is_empty() {
-        content.push_str("\n## Acceptance Criteria\n\n");
-        for criterion in &task.acceptance_criteria {
-            content.push_str(&format!("- [ ] {}\n", criterion));
-        }
-    }
-
-    content
-}
-
-fn format_status(status: &TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Pending => "pending",
-        TaskStatus::InProgress => "in_progress",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Skipped => "skipped",
-    }
-}
-
-fn format_complexity(complexity: &TaskComplexity) -> &'static str {
-    match complexity {
-        TaskComplexity::Low => "low",
-        TaskComplexity::Medium => "medium",
-        TaskComplexity::High => "high",
-    }
 }
 
 /// Generates a markdown plan document from a CruisePlan.
@@ -473,13 +426,31 @@ pub fn generate_pr_body(plan: &CruisePlan, user_prompt: &str, iterations: u32) -
     body.push_str(user_prompt);
     body.push_str("\n\n</details>\n\n");
 
+    // Spawn Instances section (security-critical)
+    if !plan.spawn_instances.is_empty() {
+        body.push_str(&format!("## Spawn Instances ({})\n\n", plan.spawn_instances.len()));
+        body.push_str("**⚠️ Security Review Required**: Verify permissions and CLI parameters for each instance.\n\n");
+
+        for instance in &plan.spawn_instances {
+            body.push_str(&format!("### {} - {}\n\n", instance.id, instance.name));
+            body.push_str(&format!("- **Mode**: {}\n", if instance.use_spawn_team { "spawn-team (ping-pong)" } else { "spawn (single)" }));
+            body.push_str(&format!("- **Permissions**: `{}`\n", instance.permissions.join(", ")));
+            body.push_str(&format!("- **CLI**: `{}`\n", instance.cli_params));
+            body.push_str(&format!("- **Tasks**: {}\n\n", instance.task_ids.join(", ")));
+        }
+    }
+
     // Tasks table
     body.push_str(&format!("## Tasks ({})\n\n", plan.tasks.len()));
-    body.push_str("| ID | Subject | Component | Complexity | Dependencies |\n");
-    body.push_str("|----|---------|-----------|------------|---------------|\n");
+    body.push_str("| ID | Subject | Permissions | Spawn Instance | Dependencies |\n");
+    body.push_str("|----|---------|-------------|----------------|---------------|\n");
     for task in &plan.tasks {
-        let component = task.component.as_deref().unwrap_or("-");
-        let complexity = format!("{:?}", task.complexity).to_lowercase();
+        let permissions = if task.permissions.is_empty() {
+            "-".to_string()
+        } else {
+            task.permissions.join(", ")
+        };
+        let spawn_instance = task.spawn_instance.as_deref().unwrap_or("-");
         let deps = if task.blocked_by.is_empty() {
             "-".to_string()
         } else {
@@ -487,10 +458,33 @@ pub fn generate_pr_body(plan: &CruisePlan, user_prompt: &str, iterations: u32) -
         };
         body.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
-            task.id, task.subject, component, complexity, deps
+            task.id, task.subject, permissions, spawn_instance, deps
         ));
     }
     body.push('\n');
+
+    // Task details with CLI params
+    body.push_str("<details>\n");
+    body.push_str("<summary>Task Details with CLI Parameters</summary>\n\n");
+    for task in &plan.tasks {
+        body.push_str(&format!("#### {}: {}\n\n", task.id, task.subject));
+        body.push_str(&format!("- **Description**: {}\n", task.description));
+        body.push_str(&format!("- **Complexity**: {:?}\n", task.complexity));
+        if let Some(ref cli) = task.cli_params {
+            body.push_str(&format!("- **CLI**: `{}`\n", cli));
+        }
+        if !task.permissions.is_empty() {
+            body.push_str(&format!("- **Permissions**: `{}`\n", task.permissions.join(", ")));
+        }
+        if !task.acceptance_criteria.is_empty() {
+            body.push_str("- **Acceptance Criteria**:\n");
+            for criterion in &task.acceptance_criteria {
+                body.push_str(&format!("  - {}\n", criterion));
+            }
+        }
+        body.push('\n');
+    }
+    body.push_str("</details>\n\n");
 
     // ASCII dependency graph
     body.push_str("## Dependency Graph\n\n");
@@ -788,65 +782,6 @@ Here's my plan:
 
         let result = validate_plan(&plan);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn plan_to_beads_creates_files() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let beads_dir = temp_dir.path().join(".beads");
-
-        let mut plan = CruisePlan::new("test");
-        plan.tasks = vec![
-            CruiseTask::new("CRUISE-001", "First task")
-                .with_description("Do the first thing")
-                .with_component("core"),
-            CruiseTask::new("CRUISE-002", "Second task")
-                .with_blocked_by(vec!["CRUISE-001".to_string()]),
-        ];
-
-        let files = plan_to_beads(&plan, &beads_dir).unwrap();
-
-        assert_eq!(files.len(), 2);
-        assert!(beads_dir.join("CRUISE-001.md").exists());
-        assert!(beads_dir.join("CRUISE-002.md").exists());
-    }
-
-    #[test]
-    fn format_beads_issue_includes_frontmatter() {
-        let task = CruiseTask::new("CRUISE-001", "Test task")
-            .with_description("Description here")
-            .with_component("testing")
-            .with_complexity(TaskComplexity::High)
-            .with_blocked_by(vec!["CRUISE-000".to_string()]);
-
-        let content = format_beads_issue(&task);
-
-        assert!(content.starts_with("---\n"));
-        assert!(content.contains("id: CRUISE-001"));
-        assert!(content.contains("subject: Test task"));
-        assert!(content.contains("status: pending"));
-        assert!(content.contains("component: testing"));
-        assert!(content.contains("complexity: high"));
-        assert!(content.contains("- CRUISE-000"));
-        assert!(content.contains("# Test task"));
-        assert!(content.contains("Description here"));
-    }
-
-    #[test]
-    fn format_beads_issue_includes_acceptance_criteria() {
-        let mut task = CruiseTask::new("CRUISE-001", "Task");
-        task.acceptance_criteria = vec![
-            "First criterion".to_string(),
-            "Second criterion".to_string(),
-        ];
-
-        let content = format_beads_issue(&task);
-
-        assert!(content.contains("## Acceptance Criteria"));
-        assert!(content.contains("- [ ] First criterion"));
-        assert!(content.contains("- [ ] Second criterion"));
     }
 
     #[test]

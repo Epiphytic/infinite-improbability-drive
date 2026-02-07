@@ -1,0 +1,23 @@
+name: code-generation
+description: Generate a simple Rust function with tests
+runner: claude
+
+prompt: |
+  Create a Rust library that provides a function to add two numbers.
+
+  Requirements:
+  - Create Cargo.toml for a library crate named "adder"
+  - Create src/lib.rs with a function `add(a: i32, b: i32) -> i32`
+  - Include unit tests that verify add(2, 2) == 4 and add(-1, 1) == 0
+
+  Make sure the tests pass when running `cargo test`.
+
+validation:
+  level: test
+  expected_files:
+    - Cargo.toml
+    - src/lib.rs
+  build_command: cargo build
+  test_command: cargo test
+
+timeout: 300

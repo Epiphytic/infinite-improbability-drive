@@ -71,3 +71,19 @@ pub trait LLMRunner: Send + Sync {
     /// Returns the name of this runner.
     fn name(&self) -> &str;
 }
+
+/// Blanket implementation for boxed trait objects.
+#[async_trait]
+impl LLMRunner for Box<dyn LLMRunner> {
+    async fn spawn(
+        &self,
+        config: LLMSpawnConfig,
+        output_tx: mpsc::Sender<LLMOutput>,
+    ) -> Result<LLMResult> {
+        (**self).spawn(config, output_tx).await
+    }
+
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+}
