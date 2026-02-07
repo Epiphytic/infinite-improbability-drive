@@ -316,6 +316,62 @@ git2 = "0.19"               # Git operations
 - **Restricted `$PATH`**: Bash commands run with limited command availability
 - **Network restrictions**: Only allowed command patterns have network access
 
+## Gemini CLI: Asking Users Questions
+
+Reference: `google-gemini/gemini-cli` — `packages/core/src/confirmation-bus/types.ts`, `packages/cli/src/ui/components/AskUserDialog.test.tsx`
+
+### Question Types
+
+```typescript
+enum QuestionType {
+  CHOICE = 'choice',   // Multiple-choice with selectable options (default)
+  TEXT = 'text',        // Free-form text input
+  YESNO = 'yesno',     // Binary Yes/No
+}
+```
+
+### Question Interface
+
+```typescript
+interface QuestionOption {
+  label: string;        // Display text (1-5 words)
+  description: string;  // Brief explanation
+}
+
+interface Question {
+  question: string;          // Full question text, should end with "?"
+  header: string;            // Short chip/tag label (max 16 chars), e.g. "Auth method"
+  type?: QuestionType;       // Defaults to 'choice'
+  options?: QuestionOption[];// Required for 'choice', ignored for 'text'/'yesno'
+  multiSelect?: boolean;     // Allow multiple selections ('choice' only)
+  placeholder?: string;      // Hint text for text input or the "Other" custom input
+}
+```
+
+### Tool Schema (AskUserTool)
+
+- Tool name: `ask_user`
+- Accepts 1–4 questions per invocation
+- An "Other" free-text option is automatically appended to every choice list
+- Answers returned as `{ [questionIndex: string]: string }` (e.g. `{ '0': 'OAuth 2.0', '1': 'Vite' }`)
+- Cancellation sets `cancelled: true` on the response
+
+### Communication Flow
+
+Uses a `MessageBus` pub/sub pattern:
+1. Tool sends `ASK_USER_REQUEST` with `questions[]` + `correlationId`
+2. UI renders `AskUserDialog` component
+3. UI sends back `ASK_USER_RESPONSE` with `answers` dict (or `cancelled: true`)
+
+### UI Behaviors
+
+- **Single select**: Up/Down to navigate options, Enter to select and submit
+- **Multi-select**: Enter toggles items on/off, navigate to "Done" row and Enter to submit
+- **Type-to-jump**: Typing any unbound character jumps to the "Other" custom input and starts filling it
+- **Multi-question navigation**: Left/Right arrow keys move between questions
+- **Review tab**: Automatically shown as final tab when >1 question. Displays all answers, warns about unanswered questions, Enter submits all
+- **Scroll arrows**: Shown when options overflow available height (unless using alternate buffer)
+
 ## Common Tasks
 
 ### Adding a new LLM runner
