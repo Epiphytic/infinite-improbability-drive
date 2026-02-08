@@ -96,6 +96,32 @@ NEVER implement anything yourself. Use delegate mode.
    existing plans, research, architecture docs, and reviews. Pass these file paths to
    teammates in their prompts rather than re-explaining the work from scratch.
 
+6. **Use beads as the durable issue backbone (if available).** If the `bd` CLI or beads
+   plugin is available, use it as the persistent project-level tracker. Built-in tasks
+   are ephemeral (gone when the session ends) — beads issues survive across sessions,
+   branches, and machines via git.
+
+   **How the two layers work together:**
+   - **Beads** = durable source of truth (project roadmap, epics, multi-session work)
+   - **Built-in tasks** = real-time coordination surface (in-session agent work)
+
+   **Leader workflow with beads:**
+   1. At session start, run `bd ready` to find unblocked beads issues to work on.
+   2. When starting work on a beads issue, update it: `bd update <id> --status in_progress`
+   3. Create ephemeral built-in tasks from the beads issue for in-session agent coordination.
+   4. Include the beads issue ID in teammate prompts so they can add comments.
+   5. When agents complete their work, close the beads issue: `bd close <id>`
+   6. For work that can't be finished this session, add a comment with progress and leave
+      the beads issue open — the next session picks up where this one left off.
+
+   **Instruct teammates to update beads regularly:**
+   - Add comments on their assigned beads issue when they hit milestones or decisions
+   - Update status when transitioning (starting, blocked, completed)
+   - Create new beads issues for follow-up work they discover during implementation
+
+   This way, even if a session crashes or context compacts, the decision history and
+   progress state are preserved in git.
+
 ## Spawning Teammates
 
 When spawning a teammate using the Task tool with a `team_name`:
@@ -126,10 +152,19 @@ When complete, write your output to:
 - <docs/plans/YYYY-MM-DD-subject.md> (for planners)
 - etc.
 
+[BEADS TRACKING — include if beads is available]
+This work is tracked as beads issue <id> (<title>).
+- Add comments to the issue when you hit milestones or make key decisions:
+  `bd comments add <id> "your update here"`
+- If you discover follow-up work, create a new beads issue:
+  `bd create --title "..." --type task --label <role>`
+- When your work is complete, the team leader will close the issue.
+
 [COMPLETION CRITERIA]
 Your work is done when:
 - <specific, verifiable criteria>
-- Mark your task as completed when all criteria are met.
+- Mark your built-in task as completed when all criteria are met.
+- Add a final comment to beads issue <id> summarizing what was done.
 ```
 
 ### Teammate Sizing Guidelines
@@ -162,29 +197,42 @@ Your work is done when:
 ### Phase 1: Understand
 
 1. Read the task/request from the user.
-2. Check `docs/` for existing artifacts (plans, research, architecture docs).
-3. Determine which roles are needed and what each role's piece is.
+2. If beads is available, check `bd ready` and `bd list --status open` for existing
+   issues related to the request. Reuse existing issues rather than creating duplicates.
+3. Check `docs/` for existing artifacts (plans, research, architecture docs).
+4. Determine which roles are needed and what each role's piece is.
 
 ### Phase 2: Spawn & Assign
 
-4. Create the team with `TeamCreate`.
-5. Create tasks with `TaskCreate` — one per role assignment, with dependencies.
-6. Spawn teammates with `Task` tool, using composed prompts (role + overlay + context).
-7. Assign tasks to teammates with `TaskUpdate`.
+5. If beads is available and no issue exists yet, create one:
+   `bd create --title "<task>" --type feature|task|bug --priority P1`
+   Update existing issues to `in_progress`: `bd update <id> --status in_progress`
+6. Create the team with `TeamCreate`.
+7. Create built-in tasks with `TaskCreate` — one per role assignment, with dependencies.
+   Reference the beads issue ID in each task description for traceability.
+8. Spawn teammates with `Task` tool, using composed prompts (role + overlay + context).
+   Include beads issue ID(s) in each teammate's prompt.
+9. Assign tasks to teammates with `TaskUpdate`.
 
 ### Phase 3: Monitor & Steer
 
-8. Messages from teammates arrive automatically — you don't need to poll.
-9. When a teammate completes their task, check `TaskList` for newly unblocked work.
-10. If a teammate is stuck, send them guidance via `SendMessage`.
-11. If a teammate's output doesn't meet quality bar, create a follow-up task.
+10. Messages from teammates arrive automatically — you don't need to poll.
+11. When a teammate completes their task, check `TaskList` for newly unblocked work.
+12. If a teammate is stuck, send them guidance via `SendMessage`.
+13. If a teammate's output doesn't meet quality bar, create a follow-up task.
+14. Periodically add progress comments to beads issues so the decision trail is preserved
+    even if the session is interrupted.
 
 ### Phase 4: Synthesize & Clean Up
 
-12. When all tasks are complete, review the artifacts produced.
-13. Report the summary to the user: what was done, what artifacts were produced, any issues.
-14. Send shutdown requests to all teammates.
-15. Clean up the team with `TeamDelete` after all teammates have shut down.
+15. When all tasks are complete, review the artifacts produced.
+16. If beads is available:
+    - Close completed issues: `bd close <id> --comment "Completed. Artifacts: <paths>"`
+    - Create follow-up issues for any discovered work that wasn't in scope
+    - Add a final summary comment to the parent epic if one exists
+17. Report the summary to the user: what was done, what artifacts were produced, any issues.
+18. Send shutdown requests to all teammates.
+19. Clean up the team with `TeamDelete` after all teammates have shut down.
 
 ## Task Dependency Patterns
 
@@ -1620,6 +1668,47 @@ sec-review ──writes──→ docs/reviews/security/ ──read by──→ c
 
 Each artifact is a checkpoint. If an agent fails or is restarted, it picks up from
 the last written artifact rather than starting from scratch.
+
+### Beads integration (persistent issue tracking)
+
+If the [beads](https://github.com/steveyegge/beads) plugin or `bd` CLI is available,
+it provides a durable project-level tracking layer that complements the ephemeral
+built-in task system. Use both together:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  BEADS (durable — git-committed, survives across sessions)  │
+│  Epics, issues, priorities, labels, comments, search        │
+│                                                             │
+│  bd-a1b2 [feature] "Add auth module"  ← project roadmap    │
+│    └─ bd-c3d4 [task] "Implement JWT handler"                │
+│    └─ bd-e5f6 [task] "Write auth tests"                     │
+│    └─ bd-g7h8 [task] "Security review"                      │
+├─────────────────────────────────────────────────────────────┤
+│  BUILT-IN TASKS (ephemeral — lives only during session)     │
+│  In-session agent coordination, progress spinners, claiming │
+│                                                             │
+│  Task 1: "Implement JWT handler" (coder) → from bd-c3d4    │
+│  Task 2: "Write auth tests" (tester) blocked by Task 1     │
+│  Task 3: "Security review" (sec-reviewer) blocked by 1+2   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**All roles should update beads when available:**
+
+| When | Action | Command |
+|------|--------|---------|
+| Starting work on an issue | Set status to in_progress | `bd update <id> --status in_progress` |
+| Reaching a milestone | Add a progress comment | `bd comments add <id> "Completed X, starting Y"` |
+| Making a key decision | Record the rationale | `bd comments add <id> "Chose JWT over sessions because..."` |
+| Discovering follow-up work | Create a new issue | `bd create --title "..." --type task` |
+| Completing the work | Close with summary | `bd close <id> --comment "Done. Artifacts: ..."` |
+| Hitting a blocker | Record the blocker | `bd comments add <id> "Blocked on: ..."` |
+| Session ending before completion | Leave a handoff comment | `bd comments add <id> "Progress: X done, Y remaining. Next steps: ..."` |
+
+The handoff comment is critical — it's what makes multi-session work possible. When a
+new session starts, the next agent reads `bd show <id>` and picks up exactly where the
+previous session left off, with full decision history.
 
 ### Role combinations
 
