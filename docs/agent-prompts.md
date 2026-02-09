@@ -126,6 +126,33 @@ NEVER implement anything yourself. Use delegate mode.
    This way, even if a session crashes or context compacts, the decision history and
    progress state are preserved in git.
 
+7. **End-to-end tests are a hard requirement.** No feature, module, or system is considered
+   complete without E2E tests that prove it works as a user would experience it. This is
+   not optional and not "if time permits" — it is a mandatory part of every deliverable.
+
+   **For every piece of work, you MUST spawn a `tester + [e2e]` teammate.** The E2E tester
+   runs after the coder and unit tester finish. Their job is to prove the feature works
+   end-to-end with real services, real data, and real user-facing interactions.
+
+   **Planning implications:**
+   - When estimating team composition, always include an E2E tester alongside the unit tester
+   - E2E test tasks are blocked by implementation AND unit test tasks
+   - The reviewer should not begin until E2E tests exist and pass
+   - If E2E tests cannot be written (e.g., no test harness exists yet), the FIRST task is
+     to build the E2E test infrastructure — not to skip E2E testing
+
+   **The quality gate is:**
+   ```
+   Implementation complete
+     AND unit tests pass
+       AND E2E tests pass
+         AND review approved
+           → THEN the work is done
+   ```
+
+   Without E2E tests, the work is incomplete regardless of how clean the implementation is.
+   Unit tests prove the pieces work. E2E tests prove the system works. Both are required.
+
 ## Spawning Teammates
 
 When spawning a teammate using the Task tool with a `team_name`:
@@ -175,10 +202,14 @@ Your work is done when:
 
 | Team Size | When to Use |
 |-----------|------------|
-| 1-2 | Simple feature: coder + tester |
-| 3-4 | Standard feature: planner + coder + tester + reviewer |
-| 5-7 | Complex feature: researcher + architect + planner + coder + tester + reviewer + security |
+| 2-3 | Simple feature: coder + tester[unit] + tester[e2e] |
+| 4-5 | Standard feature: planner + coder + tester[unit] + tester[e2e] + reviewer |
+| 5-7 | Complex feature: researcher + architect + planner + coder + tester[unit] + tester[e2e] + reviewer |
 | >7 | Split into phases — coordination overhead exceeds benefit |
+
+Note: E2E tester is always included. The minimum viable team for any feature is
+coder + tester[e2e]. Unit tests can be written by the coder in simple cases, but
+E2E tests are never skipped.
 
 ### Model Selection per Teammate
 
@@ -241,24 +272,33 @@ Your work is done when:
 
 ## Task Dependency Patterns
 
-### Sequential (review after implementation)
+### Standard feature (implementation → unit tests → E2E tests → review)
 ```
-Task: "Implement auth module" (coder) ──blocks──→ Task: "Test auth module" (tester)
-Task: "Test auth module" (tester)     ──blocks──→ Task: "Review auth changes" (reviewer)
+Task: "Implement auth module" (coder)
+  ──blocks──→ Task: "Unit test auth module" (tester[unit])
+  ──blocks──→ Task: "E2E test auth workflows" (tester[e2e])
+Task: "Unit test auth module" (tester[unit])  ──blocks──→ Task: "Review auth changes" (reviewer)
+Task: "E2E test auth workflows" (tester[e2e]) ──blocks──→ Task: "Review auth changes" (reviewer)
 ```
 
-### Parallel (independent modules)
+### Parallel modules (E2E tests after all implementations)
 ```
 Task: "Implement auth module" (coder-1)     [no dependencies]
 Task: "Implement logging module" (coder-2)  [no dependencies]
-Task: "Review both modules" (reviewer)      [blocked by both above]
+Task: "Unit test auth" (tester[unit]-1)     [blocked by coder-1]
+Task: "Unit test logging" (tester[unit]-2)  [blocked by coder-2]
+Task: "E2E test full system" (tester[e2e])  [blocked by ALL above]
+Task: "Review all changes" (reviewer)       [blocked by E2E]
 ```
 
-### Research-first (design before implementation)
+### Research-first (design → plan → implement → test → review)
 ```
 Task: "Research auth approaches" (researcher) ──blocks──→ Task: "Design auth system" (architect)
 Task: "Design auth system" (architect)        ──blocks──→ Task: "Plan implementation" (planner)
 Task: "Plan implementation" (planner)         ──blocks──→ Task: "Implement" (coder)
+Task: "Implement" (coder)                    ──blocks──→ Task: "Unit tests" (tester[unit])
+Task: "Implement" (coder)                    ──blocks──→ Task: "E2E tests" (tester[e2e])
+Task: "Unit tests" + "E2E tests"             ──blocks──→ Task: "Review" (reviewer)
 ```
 
 ## Anti-Patterns (Never Do These)
