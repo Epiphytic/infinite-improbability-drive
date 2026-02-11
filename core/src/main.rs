@@ -4,18 +4,48 @@
 
 use std::path::PathBuf;
 
+use improbability_drive::runner::{ClaudeRunner, GeminiRunner, LLMRunner};
 use improbability_drive::sandbox::WorktreeSandbox;
 use improbability_drive::spawn::Spawner;
 use improbability_drive::{SandboxManifest, SpawnConfig, SpawnStatus};
 
-fn main() {
-    // Initialize tracing
+/// Check if debug mode is enabled via environment variable.
+fn is_debug_mode() -> bool {
+    std::env::var("CRUISE_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Check if fail-fast mode is enabled via environment variable.
+fn is_fail_fast_mode() -> bool {
+    std::env::var("CRUISE_FAIL_FAST")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+#[tokio::main]
+async fn main() {
+    let debug_mode = is_debug_mode();
+    let fail_fast = is_fail_fast_mode();
+
+    // Initialize tracing with debug level if CRUISE_DEBUG is set
+    let log_level = if debug_mode {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+                .add_directive(log_level.into()),
         )
         .init();
+
+    if debug_mode {
+        eprintln!("=== CRUISE DEBUG MODE ENABLED ===");
+        eprintln!("CRUISE_FAIL_FAST: {}", fail_fast);
+    }
 
     // Parse args (basic for now - will add clap in later phase)
     let args: Vec<String> = std::env::args().collect();
@@ -23,6 +53,8 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: {} <prompt>", args[0]);
         eprintln!("\nSpawns a sandboxed LLM instance with the given prompt.");
+        eprintln!("\nEnvironment variables:");
+        eprintln!("  SPAWN_RUNNER=claude|gemini  Select LLM runner (default: claude)");
         std::process::exit(1);
     }
 
@@ -35,6 +67,19 @@ fn main() {
     let logs_dir = PathBuf::from(".improbability-drive/spawns");
     let sandbox_dir = std::env::temp_dir().join("improbability-drive-sandboxes");
 
+    // Select runner based on environment variable
+    let runner_name = std::env::var("SPAWN_RUNNER").unwrap_or_else(|_| "claude".to_string());
+    let runner: Box<dyn LLMRunner> = match runner_name.as_str() {
+        "gemini" => {
+            tracing::info!("using Gemini runner");
+            Box::new(GeminiRunner::new())
+        }
+        _ => {
+            tracing::info!("using Claude runner");
+            Box::new(ClaudeRunner::new())
+        }
+    };
+
     // Create spawner
     let provider = WorktreeSandbox::new(repo_path, Some(sandbox_dir));
     let spawner = Spawner::new(provider, logs_dir);
@@ -46,7 +91,7 @@ fn main() {
     // Run spawn
     tracing::info!(prompt = %prompt, "starting spawn");
 
-    match spawner.spawn(config, manifest) {
+    match spawner.spawn(config, manifest, runner).await {
         Ok(result) => {
             println!("\n{}", "=".repeat(60));
             println!("Spawn Complete: {}", result.spawn_id);

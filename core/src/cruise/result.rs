@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use super::task::TaskStatus;
+use crate::team_orchestrator::SpawnObservability;
 
 /// Result of the planning phase.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PlanResult {
     /// Whether planning succeeded.
     pub success: bool,
@@ -22,6 +23,8 @@ pub struct PlanResult {
     pub plan_file: Option<String>,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Observability data from spawn-team.
+    pub observability: Option<SpawnObservability>,
 }
 
 /// Result of a single task execution.
@@ -40,10 +43,12 @@ pub struct TaskResult {
 }
 
 /// Result of the build phase.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct BuildResult {
     /// Whether build succeeded.
     pub success: bool,
+    /// Summary of the build phase (includes failure reason if not successful).
+    pub summary: String,
     /// Results for each task.
     pub task_results: Vec<TaskResult>,
     /// Maximum parallelism achieved.
@@ -54,6 +59,8 @@ pub struct BuildResult {
     pub completed_count: usize,
     /// Count of blocked tasks.
     pub blocked_count: usize,
+    /// Observability data from spawn-team.
+    pub observability: Option<SpawnObservability>,
 }
 
 impl BuildResult {
@@ -186,7 +193,7 @@ impl ValidationResult {
 }
 
 /// Overall result of a cruise-control run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CruiseResult {
     /// Whether the overall run succeeded.
     pub success: bool,
@@ -204,6 +211,47 @@ pub struct CruiseResult {
     pub summary: String,
 }
 
+impl CruiseResult {
+    /// Returns combined observability from all phases.
+    pub fn combined_observability(&self) -> SpawnObservability {
+        let mut combined = SpawnObservability::default();
+
+        if let Some(ref plan) = self.plan_result {
+            if let Some(ref obs) = plan.observability {
+                combined.command_lines.extend(obs.command_lines.clone());
+                combined
+                    .permissions_requested
+                    .extend(obs.permissions_requested.clone());
+                combined
+                    .permissions_granted
+                    .extend(obs.permissions_granted.clone());
+                combined.review_feedback.extend(obs.review_feedback.clone());
+                combined
+                    .security_findings
+                    .extend(obs.security_findings.clone());
+            }
+        }
+
+        if let Some(ref build) = self.build_result {
+            if let Some(ref obs) = build.observability {
+                combined.command_lines.extend(obs.command_lines.clone());
+                combined
+                    .permissions_requested
+                    .extend(obs.permissions_requested.clone());
+                combined
+                    .permissions_granted
+                    .extend(obs.permissions_granted.clone());
+                combined.review_feedback.extend(obs.review_feedback.clone());
+                combined
+                    .security_findings
+                    .extend(obs.security_findings.clone());
+            }
+        }
+
+        combined
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +260,7 @@ mod tests {
     fn build_result_success_rate() {
         let result = BuildResult {
             success: true,
+            summary: "Test completed".to_string(),
             task_results: vec![
                 TaskResult {
                     task_id: "1".to_string(),
@@ -232,6 +281,7 @@ mod tests {
             duration: Duration::from_secs(90),
             completed_count: 1,
             blocked_count: 1,
+            observability: None,
         };
 
         assert_eq!(result.success_rate(), 50.0);
@@ -241,11 +291,13 @@ mod tests {
     fn build_result_success_rate_empty() {
         let result = BuildResult {
             success: true,
+            summary: "Empty test".to_string(),
             task_results: vec![],
             max_parallelism: 0,
             duration: Duration::from_secs(0),
             completed_count: 0,
             blocked_count: 0,
+            observability: None,
         };
 
         assert_eq!(result.success_rate(), 100.0);

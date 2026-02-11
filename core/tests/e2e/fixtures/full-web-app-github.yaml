@@ -1,0 +1,50 @@
+name: full-web-app-github
+description: Full web application with SQLite, JWT auth, htmx frontend, and Rust backend (GitHub PR-based mode)
+runner: claude
+workflow: full
+team_mode: git_hub
+
+prompt: |
+  Build a web application that allows users to edit an SQLite database.
+
+  Requirements:
+  1. Authentication using JWT tokens
+     - A local JWT CA with local private key and certificate should exist
+     - Expose a .well-known endpoint for public keys
+
+  2. Frontend
+     - Use htmx for the frontend
+     - Allow users to add/remove tables
+     - Allow users to change table structure (add/remove columns)
+
+  3. Backend
+     - Use Rust for the backend
+     - Store data in SQLite
+
+  4. Testing
+     - Use Playwright for E2E testing
+     - Test logging into the app using a short-lived JWT token
+     - Test adding and removing tables
+     - Test changing table structure
+     - Push test results to the repository for validation on the PR
+
+  5. CI/CD
+     - Create GitHub Actions workflows for:
+       - Lint checks using Super-Linter (github/super-linter)
+       - Dependency review using dependency-review-action (https://github.com/actions/dependency-review-action)
+       - Run on all PRs
+
+validation:
+  level: full
+  expected_files:
+    - Cargo.toml
+    - src/main.rs
+    # Note: templates/ is used instead of static/index.html for htmx apps
+    - templates/
+    - .github/workflows/lint.yml
+    - .github/workflows/dependency-review.yml
+  build_command: cargo build --release
+  test_command: cargo test
+  # e2e_command: cargo test --test e2e  # Disabled: Playwright tests may not be fully set up
+
+timeout: 1800  # 30 minutes for complex implementations

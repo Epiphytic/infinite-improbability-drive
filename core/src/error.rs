@@ -45,6 +45,10 @@ pub enum Error {
     /// Dependency cycle detected in plan.
     #[error("dependency cycle detected: {0}")]
     DependencyCycle(String),
+
+    /// Beads operation failed.
+    #[error("beads operation failed: {0}")]
+    Beads(String),
 }
 
 /// Result type alias for spawn operations.

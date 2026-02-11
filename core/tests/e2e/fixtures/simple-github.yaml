@@ -1,0 +1,45 @@
+name: simple-github
+description: Simple Rust library using GitHub PR-based review workflow
+runner: claude
+workflow: full
+team_mode: git_hub
+
+# Planning prompt - generates a plan document
+planning_prompt: |
+  Create an implementation plan for building a simple greeting library in Rust.
+
+  IMPORTANT: Create a file called PLAN.md in the ROOT of the repository (not in a subdirectory).
+
+  The PLAN.md file should contain:
+  1. Overview section describing what we're building
+  2. Tasks section with numbered tasks
+  3. Each task should have a description
+
+  Keep it simple - just 2-3 tasks for:
+  - Setting up Cargo.toml
+  - Creating the lib.rs with a greet function
+  - Adding a simple test
+
+  Create the PLAN.md file at the repository root.
+
+# Execution prompt - implements the plan
+prompt: |
+  You have a PLAN.md file in this repository. Read it and implement the plan.
+
+  Create a simple Rust project with:
+  1. Cargo.toml - name "greetlib", edition 2021
+  2. src/lib.rs - a public function `greet(name: &str) -> String` that returns "Hello, {name}!"
+  3. A test in the same file that verifies greet("World") returns "Hello, World!"
+
+  Make sure the code compiles and tests pass.
+
+validation:
+  level: test
+  expected_files:
+    - Cargo.toml
+    - src/lib.rs
+    # Note: Claude may put plan in docs/plans/ instead of root
+  build_command: cargo build
+  test_command: cargo test
+
+timeout: 600  # 10 minutes - simple task with GitHub reviews

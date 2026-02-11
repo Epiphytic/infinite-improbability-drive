@@ -60,6 +60,8 @@ pub struct WatcherResult {
     pub applied_fixes: Vec<PermissionFix>,
     /// Reason for termination, if any.
     pub termination_reason: Option<TerminationReason>,
+    /// Path to sandbox (not cleaned up on success for validation).
+    pub sandbox_path: Option<PathBuf>,
 }
 
 /// Reason the watcher terminated the spawn.
@@ -69,12 +71,27 @@ pub enum TerminationReason {
     Success,
     /// LLM exited with error.
     LLMError(String),
-    /// Timeout occurred.
+    /// Timeout occurred with details for debugging.
     Timeout(TimeoutReason),
     /// Unrecoverable permission error.
     PermissionError(String),
     /// Escalation limit reached.
     EscalationLimitReached,
+}
+
+/// Detailed information about a timeout for debugging.
+#[derive(Debug, Clone, Default)]
+pub struct TimeoutDetails {
+    /// The CLI command that was running.
+    pub cli_command: String,
+    /// Last output lines received (up to 50 lines).
+    pub last_output: Vec<String>,
+    /// How long the LLM was idle before timeout.
+    pub idle_duration_secs: f64,
+    /// Total elapsed time when timeout occurred.
+    pub total_duration_secs: f64,
+    /// The timeout reason.
+    pub reason: Option<TimeoutReason>,
 }
 
 /// The watcher agent that orchestrates spawn lifecycle.
@@ -101,10 +118,28 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
     }
 
     /// Runs a spawn with full lifecycle management.
+    ///
+    /// On success, the sandbox is NOT cleaned up - the caller is responsible
+    /// for cleaning up after validation. The sandbox path is returned in
+    /// `WatcherResult::sandbox_path`.
+    ///
+    /// On failure (timeout, errors), the sandbox IS cleaned up automatically.
     pub async fn run(
         &self,
         prompt: String,
         initial_manifest: SandboxManifest,
+    ) -> Result<WatcherResult> {
+        self.run_with_branch(prompt, initial_manifest, None).await
+    }
+
+    /// Runs a spawn with an explicit branch name.
+    ///
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    pub async fn run_with_branch(
+        &self,
+        prompt: String,
+        initial_manifest: SandboxManifest,
+        branch_name: Option<&str>,
     ) -> Result<WatcherResult> {
         let mut manifest = initial_manifest;
         let mut permission_errors = Vec::new();
@@ -112,39 +147,54 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         let mut escalation_count = 0;
 
         loop {
-            // Create sandbox
-            let mut sandbox = self.provider.create(manifest.clone())?;
+            // Create sandbox with optional explicit branch name
+            let mut sandbox = match branch_name {
+                Some(name) => self.provider.create_with_branch(manifest.clone(), name)?,
+                None => self.provider.create(manifest.clone())?,
+            };
+            let sandbox_path = sandbox.path().clone();
 
             // Run LLM with monitoring
             let result = self
-                .run_with_monitoring(&prompt, sandbox.path().clone(), &manifest)
+                .run_with_monitoring(&prompt, sandbox_path.clone(), &manifest)
                 .await;
-
-            // Cleanup sandbox
-            sandbox.cleanup()?;
 
             match result {
                 Ok((progress, None)) => {
-                    // Success!
+                    // Success - DON'T cleanup, let caller validate first
+                    // Forget the sandbox so Drop doesn't cleanup
+                    std::mem::forget(sandbox);
+
                     return Ok(WatcherResult {
                         success: true,
                         progress,
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::Success),
+                        sandbox_path: Some(sandbox_path),
                     });
                 }
                 Ok((progress, Some(timeout_reason))) => {
-                    // Timeout
+                    // Timeout - preserve sandbox for partial work recovery
+                    // The caller can decide to commit and push any partial work
+                    let sandbox_path = sandbox.path().to_path_buf();
+
+                    // Prevent cleanup so partial work is preserved
+                    std::mem::forget(sandbox);
+
                     return Ok(WatcherResult {
                         success: false,
                         progress,
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::Timeout(timeout_reason)),
+                        sandbox_path: Some(sandbox_path),
                     });
                 }
                 Err(WatcherError::PermissionErrors(errors, progress)) => {
+                    // Cleanup this sandbox before potentially retrying
+                    sandbox.cleanup()?;
+
                     // Handle permission errors based on strategy
                     for error in &errors {
                         permission_errors.push(error.clone());
@@ -159,6 +209,7 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                                     termination_reason: Some(TerminationReason::PermissionError(
                                         reason.clone(),
                                     )),
+                                    sandbox_path: None,
                                 });
                             }
                             fix => {
@@ -174,6 +225,7 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                                         termination_reason: Some(
                                             TerminationReason::EscalationLimitReached,
                                         ),
+                                        sandbox_path: None,
                                     });
                                 }
 
@@ -187,12 +239,16 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                     // Continue loop with updated manifest
                 }
                 Err(WatcherError::LLMError(msg, progress)) => {
+                    // LLM error - cleanup sandbox
+                    sandbox.cleanup()?;
+
                     return Ok(WatcherResult {
                         success: false,
                         progress,
                         permission_errors,
                         applied_fixes,
                         termination_reason: Some(TerminationReason::LLMError(msg)),
+                        sandbox_path: None,
                     });
                 }
             }
@@ -209,16 +265,28 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         let mut monitor = ProgressMonitor::new(self.config.timeout);
         let mut detected_errors = Vec::new();
 
+        // Track last output lines for timeout debugging (circular buffer of 50 lines)
+        let mut last_output_lines: Vec<String> = Vec::with_capacity(50);
+        const MAX_OUTPUT_LINES: usize = 50;
+
         // Create output channel
         let (tx, mut rx) = mpsc::channel::<LLMOutput>(100);
 
         // Build spawn config
         let spawn_config = LLMSpawnConfig {
             prompt: prompt.to_string(),
-            working_dir,
+            working_dir: working_dir.clone(),
             manifest: manifest.clone(),
             model: None,
         };
+
+        // Build CLI command string for debugging
+        let cli_command = format!(
+            "{} --print --working-dir {:?} (prompt: {}...)",
+            self.runner.name(),
+            working_dir,
+            prompt.chars().take(50).collect::<String>()
+        );
 
         // Spawn LLM in background
         let runner = self.runner.clone();
@@ -228,15 +296,48 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
         while let Some(output) = rx.recv().await {
             // Check for timeout
             if let Some(reason) = monitor.check_timeout() {
+                // Log detailed timeout information for debugging
+                let timeout_details = TimeoutDetails {
+                    cli_command: cli_command.clone(),
+                    last_output: last_output_lines.clone(),
+                    idle_duration_secs: monitor.idle_duration().as_secs_f64(),
+                    total_duration_secs: monitor.total_duration().as_secs_f64(),
+                    reason: Some(reason),
+                };
+
+                tracing::error!(
+                    timeout_reason = ?reason,
+                    cli_command = %timeout_details.cli_command,
+                    idle_duration_secs = %timeout_details.idle_duration_secs,
+                    total_duration_secs = %timeout_details.total_duration_secs,
+                    last_output_lines = ?timeout_details.last_output.len(),
+                    "LLM TIMEOUT - detailed diagnostic information"
+                );
+
+                // Log the last few output lines
+                if !timeout_details.last_output.is_empty() {
+                    tracing::error!("=== Last {} output lines before timeout ===", timeout_details.last_output.len());
+                    for (i, line) in timeout_details.last_output.iter().enumerate() {
+                        tracing::error!("[{}] {}", i + 1, line);
+                    }
+                    tracing::error!("=== End of timeout output ===");
+                }
+
                 // Cancel LLM
                 llm_handle.abort();
                 return Ok((ProgressSummary::from(&monitor), Some(reason)));
             }
 
-            // Process output
+            // Process output and track for timeout debugging
             match &output {
                 LLMOutput::Stdout(line) => {
                     monitor.record_output(1);
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[stdout] {}", line));
 
                     // Check for permission errors
                     if let Some(error) = self.detector.analyze(line) {
@@ -246,6 +347,12 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                 LLMOutput::Stderr(line) => {
                     monitor.record_output(1);
 
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[stderr] {}", line));
+
                     // Check for permission errors
                     if let Some(error) = self.detector.analyze(line) {
                         detected_errors.push(error);
@@ -253,12 +360,30 @@ impl<P: SandboxProvider + 'static, R: LLMRunner + 'static> WatcherAgent<P, R> {
                 }
                 LLMOutput::FileRead(path) => {
                     monitor.record_file_read(path.clone());
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[file_read] {:?}", path));
                 }
                 LLMOutput::FileWrite(path) => {
                     monitor.record_file_write(path.clone());
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[file_write] {:?}", path));
                 }
-                LLMOutput::ToolCall { .. } => {
+                LLMOutput::ToolCall { tool, .. } => {
                     monitor.touch();
+
+                    // Track for timeout debugging
+                    if last_output_lines.len() >= MAX_OUTPUT_LINES {
+                        last_output_lines.remove(0);
+                    }
+                    last_output_lines.push(format!("[tool_call] {}", tool));
                 }
             }
         }

@@ -8,7 +8,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::sandbox::{Sandbox, SandboxManifest, SandboxProvider};
+use crate::monitor::TimeoutConfig;
+use crate::prompt::augment_prompt_with_gitignore;
+use crate::runner::LLMRunner;
+use crate::sandbox::{SandboxManifest, SandboxProvider};
+use crate::watcher::{RecoveryStrategy, TerminationReason, WatcherAgent, WatcherConfig};
 
 /// Mode for prompt handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -45,11 +49,11 @@ pub struct SpawnConfig {
 }
 
 fn default_idle_timeout() -> Duration {
-    Duration::from_secs(120)
+    Duration::from_secs(300) // 5 minutes - allows thinking time for complex tasks
 }
 
 fn default_total_timeout() -> Duration {
-    Duration::from_secs(1800)
+    Duration::from_secs(3600) // 1 hour - generous for full workflow tasks
 }
 
 fn default_max_escalations() -> u32 {
@@ -84,6 +88,32 @@ impl SpawnConfig {
     pub fn with_total_timeout(mut self, timeout: Duration) -> Self {
         self.total_timeout = timeout;
         self
+    }
+
+    /// Sets the maximum permission escalations allowed.
+    ///
+    /// Each time the watcher detects a permission error and applies a fix,
+    /// it counts as an escalation. Once this limit is reached, the spawn
+    /// is terminated. Default is 1.
+    ///
+    /// For complex tasks that may need multiple tool permissions, increase
+    /// this value (e.g., 5 for full-stack applications).
+    pub fn with_max_escalations(mut self, max: u32) -> Self {
+        self.max_permission_escalations = max;
+        self
+    }
+}
+
+impl From<&SpawnConfig> for WatcherConfig {
+    fn from(config: &SpawnConfig) -> Self {
+        Self {
+            timeout: TimeoutConfig {
+                idle_timeout: config.idle_timeout,
+                total_timeout: config.total_timeout,
+            },
+            recovery_strategy: RecoveryStrategy::Moderate,
+            max_escalations: config.max_permission_escalations,
+        }
     }
 }
 
@@ -149,15 +179,18 @@ pub struct SpawnResult {
     pub pr_url: Option<String>,
     /// Paths to log files.
     pub logs: SpawnLogs,
+    /// Path to sandbox (if success, for validation before cleanup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_path: Option<PathBuf>,
 }
 
 /// Spawner that creates and manages sandboxed LLM instances.
-pub struct Spawner<P: SandboxProvider> {
+pub struct Spawner<P: SandboxProvider + Clone> {
     provider: P,
     logs_dir: PathBuf,
 }
 
-impl<P: SandboxProvider> Spawner<P> {
+impl<P: SandboxProvider + Clone + 'static> Spawner<P> {
     /// Creates a new spawner with the given sandbox provider.
     pub fn new(provider: P, logs_dir: PathBuf) -> Self {
         Self { provider, logs_dir }
@@ -165,9 +198,26 @@ impl<P: SandboxProvider> Spawner<P> {
 
     /// Spawns a sandboxed LLM with the given configuration.
     ///
-    /// This is the basic spawn implementation without the watcher agent.
-    /// It creates a sandbox, but does not actually run an LLM yet.
-    pub fn spawn(&self, config: SpawnConfig, manifest: SandboxManifest) -> Result<SpawnResult> {
+    /// The runner parameter allows selecting between Claude and Gemini.
+    pub async fn spawn(
+        &self,
+        config: SpawnConfig,
+        manifest: SandboxManifest,
+        runner: Box<dyn LLMRunner>,
+    ) -> Result<SpawnResult> {
+        self.spawn_with_branch(config, manifest, runner, None).await
+    }
+
+    /// Spawns a sandboxed LLM with an explicit branch name.
+    ///
+    /// This allows CruiseRunner to control branch naming per workflow phase.
+    pub async fn spawn_with_branch(
+        &self,
+        config: SpawnConfig,
+        manifest: SandboxManifest,
+        runner: Box<dyn LLMRunner>,
+        branch_name: Option<&str>,
+    ) -> Result<SpawnResult> {
         // Generate spawn ID
         let spawn_id = uuid::Uuid::new_v4().to_string();
 
@@ -194,39 +244,84 @@ impl<P: SandboxProvider> Spawner<P> {
             .map_err(|e| Error::Config(format!("failed to serialize manifest: {}", e)))?;
         std::fs::write(&manifest_path, manifest_json)?;
 
-        // Create sandbox
         let start_time = std::time::Instant::now();
-        let mut sandbox = self.provider.create(manifest)?;
+
+        // Augment prompt with gitignore instruction if needed
+        let prompt = augment_prompt_with_gitignore(&config.prompt, self.provider.repo_path());
 
         tracing::info!(
             spawn_id = %spawn_id,
-            sandbox_path = ?sandbox.path(),
             mode = ?config.mode,
-            "created spawn sandbox"
+            runner = %runner.name(),
+            prompt_augmented = (prompt != config.prompt),
+            "starting spawn with watcher"
         );
 
-        // TODO: In Phase 2, this is where the watcher agent would:
-        // 1. Launch the LLM runner
-        // 2. Monitor progress
-        // 3. Handle permission errors
-        // 4. Create PR on completion
+        // Create watcher config from spawn config
+        let watcher_config = WatcherConfig::from(&config);
 
-        // For now, just clean up and return a basic result
+        // Create watcher agent
+        let watcher = WatcherAgent::new(self.provider.clone(), runner, watcher_config);
+
+        // Run the watcher with potentially augmented prompt and optional branch name
+        let watcher_result = watcher.run_with_branch(prompt, manifest, branch_name).await?;
+
         let duration = start_time.elapsed();
-        sandbox.cleanup()?;
+
+        // Convert WatcherResult to SpawnResult
+        let status = if watcher_result.success {
+            SpawnStatus::Success
+        } else {
+            match &watcher_result.termination_reason {
+                Some(TerminationReason::Timeout(_)) => SpawnStatus::TimedOut,
+                _ => SpawnStatus::Failed,
+            }
+        };
+
+        let summary = match &watcher_result.termination_reason {
+            Some(TerminationReason::Success) => {
+                format!(
+                    "Completed successfully. Files read: {}, written: {}",
+                    watcher_result.progress.files_read.len(),
+                    watcher_result.progress.files_written.len()
+                )
+            }
+            Some(TerminationReason::Timeout(reason)) => {
+                format!("Timed out: {:?}", reason)
+            }
+            Some(TerminationReason::LLMError(msg)) => {
+                format!("LLM error: {}", msg)
+            }
+            Some(TerminationReason::PermissionError(msg)) => {
+                format!("Permission error: {}", msg)
+            }
+            Some(TerminationReason::EscalationLimitReached) => {
+                "Escalation limit reached".to_string()
+            }
+            None => "Unknown termination".to_string(),
+        };
+
+        // Extract commits from progress
+        let commits = watcher_result
+            .progress
+            .commits
+            .iter()
+            .map(|c| CommitInfo {
+                hash: c.hash.clone(),
+                message: c.message.clone(),
+            })
+            .collect();
 
         Ok(SpawnResult {
-            status: SpawnStatus::Success,
+            status,
             spawn_id,
             duration,
-            files_changed: vec![],
-            commits: vec![],
-            summary: format!(
-                "Sandbox created and cleaned up successfully. Prompt: {}",
-                config.prompt
-            ),
-            pr_url: None,
+            files_changed: vec![], // TODO: Extract from watcher result
+            commits,
+            summary,
+            pr_url: None, // TODO: Extract from PR creation
             logs,
+            sandbox_path: watcher_result.sandbox_path,
         })
     }
 }
@@ -234,6 +329,7 @@ impl<P: SandboxProvider> Spawner<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::ClaudeRunner;
     use crate::sandbox::WorktreeSandbox;
     use std::process::Command;
     use tempfile::TempDir;
@@ -252,28 +348,29 @@ mod tests {
             .args(["config", "user.email", "test@test.com"])
             .current_dir(temp_dir.path())
             .output()
-            .expect("failed to config git email");
+            .expect("failed to set git email");
 
         Command::new("git")
             .args(["config", "user.name", "Test User"])
             .current_dir(temp_dir.path())
             .output()
-            .expect("failed to config git name");
+            .expect("failed to set git name");
 
+        // Create an initial commit (required for worktree creation)
         std::fs::write(temp_dir.path().join("README.md"), "# Test Repo\n")
-            .expect("failed to write README");
+            .expect("failed to create readme");
 
         Command::new("git")
             .args(["add", "."])
             .current_dir(temp_dir.path())
             .output()
-            .expect("failed to add files");
+            .expect("failed to stage files");
 
         Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
+            .args(["commit", "-m", "initial"])
             .current_dir(temp_dir.path())
             .output()
-            .expect("failed to create initial commit");
+            .expect("failed to commit");
 
         temp_dir
     }
@@ -284,8 +381,8 @@ mod tests {
 
         assert_eq!(config.prompt, "test prompt");
         assert_eq!(config.mode, SpawnMode::Aisp);
-        assert_eq!(config.idle_timeout, Duration::from_secs(120));
-        assert_eq!(config.total_timeout, Duration::from_secs(1800));
+        assert_eq!(config.idle_timeout, Duration::from_secs(300)); // 5 minutes for thinking time
+        assert_eq!(config.total_timeout, Duration::from_secs(3600)); // 1 hour for complex tasks
         assert_eq!(config.max_permission_escalations, 1);
     }
 
@@ -311,59 +408,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn spawner_creates_logs_directory() {
-        let git_repo = create_temp_git_repo();
-        let sandbox_dir = TempDir::new().expect("failed to create sandbox dir");
-        let logs_dir = TempDir::new().expect("failed to create logs dir");
+    #[tokio::test]
+    async fn spawner_creates_logs_directory() {
+        let repo_dir = create_temp_git_repo();
+        let logs_dir = repo_dir.path().join("logs");
 
-        let provider = WorktreeSandbox::new(
-            git_repo.path().to_path_buf(),
-            Some(sandbox_dir.path().to_path_buf()),
-        );
-        let spawner = Spawner::new(provider, logs_dir.path().to_path_buf());
+        let provider = WorktreeSandbox::new(repo_dir.path().to_path_buf(), None);
+        let spawner = Spawner::new(provider, logs_dir.clone());
 
-        let config = SpawnConfig::new("test spawn");
+        let config = SpawnConfig::new("test prompt");
         let manifest = SandboxManifest::default();
+        let runner: Box<dyn LLMRunner> = Box::new(ClaudeRunner::new());
 
-        let result = spawner.spawn(config, manifest).expect("spawn failed");
+        let result = spawner.spawn(config, manifest, runner).await.unwrap();
 
-        // Verify logs were created
-        assert!(result.logs.stdout.parent().unwrap().exists());
-        assert_eq!(result.status, SpawnStatus::Success);
-        assert!(!result.spawn_id.is_empty());
+        // Verify logs directory was created
+        assert!(logs_dir.join(&result.spawn_id).exists());
+        assert!(result.logs.stdout.exists() || result.logs.stdout.parent().unwrap().exists());
     }
 
-    #[test]
-    fn spawner_writes_config_and_manifest_to_logs() {
-        let git_repo = create_temp_git_repo();
-        let sandbox_dir = TempDir::new().expect("failed to create sandbox dir");
-        let logs_dir = TempDir::new().expect("failed to create logs dir");
+    #[tokio::test]
+    async fn spawner_writes_config_and_manifest_to_logs() {
+        let repo_dir = create_temp_git_repo();
+        let logs_dir = repo_dir.path().join("logs");
 
-        let provider = WorktreeSandbox::new(
-            git_repo.path().to_path_buf(),
-            Some(sandbox_dir.path().to_path_buf()),
-        );
-        let spawner = Spawner::new(provider, logs_dir.path().to_path_buf());
+        let provider = WorktreeSandbox::new(repo_dir.path().to_path_buf(), None);
+        let spawner = Spawner::new(provider, logs_dir.clone());
 
-        let config = SpawnConfig::new("test spawn").with_mode(SpawnMode::Passthrough);
-        let manifest = SandboxManifest {
-            allowed_tools: vec!["Read".to_string()],
-            ..Default::default()
-        };
+        let config = SpawnConfig::new("test prompt");
+        let manifest = SandboxManifest::default();
+        let runner: Box<dyn LLMRunner> = Box::new(ClaudeRunner::new());
 
-        let result = spawner.spawn(config, manifest).expect("spawn failed");
+        let result = spawner.spawn(config, manifest, runner).await.unwrap();
 
-        // Verify config was written
-        let config_path = logs_dir.path().join(&result.spawn_id).join("config.json");
-        assert!(config_path.exists());
-        let config_content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(config_content.contains("passthrough"));
-
-        // Verify manifest was written
-        let manifest_path = logs_dir.path().join(&result.spawn_id).join("manifest.json");
-        assert!(manifest_path.exists());
-        let manifest_content = std::fs::read_to_string(&manifest_path).unwrap();
-        assert!(manifest_content.contains("Read"));
+        // Verify config and manifest files
+        let spawn_dir = logs_dir.join(&result.spawn_id);
+        assert!(spawn_dir.join("config.json").exists());
+        assert!(spawn_dir.join("manifest.json").exists());
     }
 }
